@@ -45,6 +45,7 @@
 
 #define MAX_SERVER_STALL_TIME_USEC (5*1000*1000)
 #define MAX_CLIENT_STALL_TIME_USEC (10*1000*1000)
+#define MAX_LOCKSTEP_STALL_TIME_USEC (30*1000*1000)
 #define CATCH_UP_CHECK_TIME_USEC   (500*1000)
 #define MAX_RETRIES                16
 #define RETRY_MS                   500
@@ -67,6 +68,20 @@
 
 /* Quirks mandated by how particular cores save states. This is distilled from
  * the larger set of quirks that the quirks environment can communicate. */
+/* A joypad-class port carried as an analog device, so that netplay
+ * synchronises its two sticks as well as its buttons (netplay_analog_joypads).
+ * The flag and the joypad's own subclass travel in the device id the host
+ * sends, so the core can still be given the device it actually asked for. */
+#define NETPLAY_DEVICE_ANALOG_JOYPAD_FLAG (UINT32_C(1) << 30)
+#define NETPLAY_DEVICE_ANALOG_JOYPAD(device) \
+   ((((device) & ~(uint32_t)RETRO_DEVICE_MASK) | RETRO_DEVICE_ANALOG) \
+      | NETPLAY_DEVICE_ANALOG_JOYPAD_FLAG)
+#define NETPLAY_DEVICE_FOR_CORE(device) \
+   (((device) & NETPLAY_DEVICE_ANALOG_JOYPAD_FLAG) \
+      ? ((((device) & ~NETPLAY_DEVICE_ANALOG_JOYPAD_FLAG) \
+            & ~(uint32_t)RETRO_DEVICE_MASK) | RETRO_DEVICE_JOYPAD) \
+      : (device))
+
 #define NETPLAY_QUIRK_INITIALIZATION     (1 << 0)
 #define NETPLAY_QUIRK_ENDIAN_DEPENDENT   (1 << 1)
 #define NETPLAY_QUIRK_PLATFORM_DEPENDENT (1 << 2)
@@ -265,7 +280,11 @@ enum rarch_netplay_stall_reason
    NETPLAY_STALL_INPUT_LATENCY,
 
    /* The server asked us to stall */
-   NETPLAY_STALL_SERVER_REQUESTED
+   NETPLAY_STALL_SERVER_REQUESTED,
+
+   /* Lockstep: the real input of every player for the frame
+      we are about to run has not arrived yet */
+   NETPLAY_STALL_LOCKSTEP
 };
 
 enum netplay_modus
@@ -324,6 +343,11 @@ struct delta_frame
 
    /* The CRC-32 of the serialized state if we've calculated it, else 0 */
    uint32_t crc;
+
+   /* Lockstep only: our own CRC for this frame, taken before the frame ran.
+    * There is no per-frame state to derive it from later. */
+   uint32_t local_crc;
+   bool have_local_crc;
 
    /* Have we read local input? */
    bool have_local;
@@ -686,6 +710,14 @@ struct netplay
 
    /* Host settings */
    bool allow_pausing;
+
+   /* Lockstep (local property, see DEFAULT_NETPLAY_LOCKSTEP): frames only run
+    * on real input, nothing is rewound, and every delta frame aliases the one
+    * state buffer below, used for joins, resyncs and CRC checks. */
+   bool lockstep;
+   void *lockstep_state;
+   /* When we began waiting for input, for the stall-out timer */
+   retro_time_t lockstep_stall_time;
 };
 
 void video_frame_net(const void *data,

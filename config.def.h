@@ -1329,6 +1329,15 @@
 /* Allow connections in slave mode */
 #define DEFAULT_NETPLAY_ALLOW_SLAVES true
 
+/* Lockstep netplay: never run a frame before every player's real input for it
+ * has arrived, so nothing is ever rewound and no per-frame savestate is taken.
+ * For cores whose savestates are too large or slow for rollback (Dolphin). */
+#define DEFAULT_NETPLAY_LOCKSTEP false
+
+/* Synchronise both analog sticks of joypad-class ports. Stock netplay only
+ * carries the digital buttons of a RETRO_DEVICE_JOYPAD port. */
+#define DEFAULT_NETPLAY_ANALOG_JOYPADS false
+
 /* Require connections only in slave mode */
 #define DEFAULT_NETPLAY_REQUIRE_SLAVES false
 

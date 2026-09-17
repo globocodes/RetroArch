@@ -906,6 +906,8 @@ typedef struct settings
       bool netplay_fade_chat;
       bool netplay_allow_pausing;
       bool netplay_allow_slaves;
+      bool netplay_lockstep;
+      bool netplay_analog_joypads;
       bool netplay_require_slaves;
       bool netplay_nat_traversal;
       bool netplay_use_mitm_server;
