@@ -4893,10 +4893,17 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_NETPLAY_ENABLE_HOST:
          {
-            if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
+            /* Lockstep hosts start on the running core, as a joining client
+             * already does: the stock path unloads and reloads the core so
+             * rollback starts from a pristine frame 0, which lockstep has no
+             * use for (joiners get a savestate) and which a core the size of
+             * Dolphin does not survive in-process. */
+            if (     netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL)
+                  || settings->bools.netplay_lockstep)
             {
                netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_SERVER, NULL);
-               command_event(CMD_EVENT_NETPLAY_INIT, NULL);
+               if (!command_event(CMD_EVENT_NETPLAY_INIT, NULL))
+                  return false;
             }
             else if (!task_push_netplay_content_reload(NULL))
             {
