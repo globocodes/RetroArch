@@ -5625,6 +5625,8 @@ static bool netplay_get_cmd(netplay_t *netplay,
 
       case NETPLAY_CMD_NAK:
          /* Disconnect now! */
+         RARCH_ERR("[Netplay] \"%s\" refused our last command (NAK).\n",
+               connection->nick);
          return false;
 
       case NETPLAY_CMD_INPUT:
@@ -9327,6 +9329,26 @@ static void netplay_disconnect_at(netplay_t *netplay, const char *func, int line
 }
 
 /**
+ * netplay_flush_output
+ *
+ * Send whatever is queued for every active connection without blocking;
+ * a socket failure hangs that connection up.
+ */
+static void netplay_flush_output(netplay_t *netplay)
+{
+   size_t i;
+   for (i = 0; i < netplay->connections_size; i++)
+   {
+      struct netplay_connection *connection = &netplay->connections[i];
+      if (   (connection->flags & NETPLAY_CONN_FLAG_ACTIVE)
+          && !netplay_send_flush(
+             &connection->send_packet_buffer, connection->fd,
+             false))
+         netplay_hangup(netplay, connection);
+   }
+}
+
+/**
  * netplay_pre_frame:
  * @netplay              : pointer to netplay object
  *
@@ -9395,6 +9417,14 @@ static bool netplay_pre_frame(netplay_t *netplay)
       /* We may have received data even if we're stalled,
        * so run post-frame sync. */
       netplay_sync_input_post_frame(netplay, true);
+
+      /* The frontend skips post_frame while we stall, and post_frame is
+       * where queued output normally drains. A lockstep host stalls the
+       * frame after it queues a joiner's savestate (it needs that joiner's
+       * input, and the joiner needs the state first), so without this the
+       * state sits in our buffer, the joiner times out waiting for it, and
+       * the session dies. Keep the sockets fed while we wait. */
+      netplay_flush_output(netplay);
       return false;
    }
 
@@ -9411,8 +9441,6 @@ static bool netplay_pre_frame(netplay_t *netplay)
  **/
 static void netplay_post_frame(netplay_t *netplay)
 {
-   size_t i;
-
    /* When a core uses the netpacket interface frames are not synced */
    if (netplay->modus == NETPLAY_MODUS_INPUT_FRAME_SYNC)
    {
@@ -9420,15 +9448,7 @@ static void netplay_post_frame(netplay_t *netplay)
       netplay_sync_input_post_frame(netplay, false);
    }
 
-   for (i = 0; i < netplay->connections_size; i++)
-   {
-      struct netplay_connection *connection = &netplay->connections[i];
-      if (   (connection->flags & NETPLAY_CONN_FLAG_ACTIVE)
-          && !netplay_send_flush(
-             &connection->send_packet_buffer, connection->fd,
-             false))
-         netplay_hangup(netplay, connection);
-   }
+   netplay_flush_output(netplay);
 
    /* If we're disconnected, deinitialize */
    if (     (!(netplay->is_server))
