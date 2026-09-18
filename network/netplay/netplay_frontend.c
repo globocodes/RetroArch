@@ -235,6 +235,14 @@ static bool netplay_process_savestate(netplay_t* netplay, retro_ctx_serialize_in
 static bool netplay_grow_states(netplay_t *netplay, size_t state_size);
 static bool netplay_init_socket_buffers(netplay_t *netplay);
 static bool netplay_lockstep_fit_state(netplay_t *netplay);
+static void netplay_hangup_at(netplay_t *netplay,
+      struct netplay_connection *connection, const char *func, int line);
+static void netplay_disconnect_at(netplay_t *netplay, const char *func, int line);
+/* Every drop logs the code that decided it */
+#define netplay_hangup(netplay, connection) \
+   netplay_hangup_at((netplay), (connection), __FUNCTION__, __LINE__)
+#define netplay_disconnect(netplay) \
+   netplay_disconnect_at((netplay), __FUNCTION__, __LINE__)
 
 /* Align to 8-byte boundary */
 #define CONTENT_ALIGN_SIZE(size) ((((size) + 7) & ~7))
@@ -3359,6 +3367,9 @@ static void netplay_handle_frame_hash(netplay_t *netplay,
 
          if (local_crc != delta->crc)
          {
+            RARCH_WARN("[Netplay] CRC mismatch on frame %u: ours %08X, theirs %08X%s.\n",
+                  delta->frame, local_crc, delta->crc,
+                  netplay->crc_validity_checked ? "" : " (first check: CRCs judged unusable)");
             /* If the very first check frame is wrong,
                they probably just don't work. */
             if (!netplay->crc_validity_checked)
@@ -4122,8 +4133,15 @@ static void netplay_sync_input_post_frame(netplay_t *netplay, bool stalled)
       serial_info.data       = NULL;
       serial_info.data_const = netplay->buffer[netplay->replay_ptr].state;
       serial_info.size       = netplay->state_size;
-      if (!netplay_process_savestate(netplay, &serial_info))
-         RARCH_ERR("[Netplay] Netplay savestate loading failed: Prepare for desync!\n");
+      {
+         retro_time_t t0 = cpu_features_get_time_usec();
+         if (!netplay_process_savestate(netplay, &serial_info))
+            RARCH_ERR("[Netplay] Netplay savestate loading failed: Prepare for desync!\n");
+         else
+            RARCH_LOG("[Netplay] Loaded the peer's state for frame %u in %d ms.\n",
+                  netplay->replay_frame_count,
+                  (int)((cpu_features_get_time_usec() - t0) / 1000));
+      }
 
       while (netplay->replay_frame_count < netplay->run_frame_count)
       {
@@ -4371,8 +4389,8 @@ static void remote_unpaused(netplay_t *netplay,
  *
  * Disconnects an active Netplay connection due to an error
  */
-static void netplay_hangup(netplay_t *netplay,
-      struct netplay_connection *connection)
+static void netplay_hangup_at(netplay_t *netplay,
+      struct netplay_connection *connection, const char *func, int line)
 {
    size_t i;
    char msg[512];
@@ -4382,6 +4400,14 @@ static void netplay_hangup(netplay_t *netplay,
 
    if (!netplay || (!(connection->flags & NETPLAY_CONN_FLAG_ACTIVE)))
       return;
+
+   /* Every drop names the code that decided it: that line is the diagnosis */
+   RARCH_LOG("[Netplay] Hanging up on \"%s\" (slot %u, mode %d, stall %d) from %s:%d; frames self=%u run=%u unread=%u read=%u.\n",
+         connection->nick, (unsigned)(connection - netplay->connections),
+         (int)connection->mode, (int)connection->stall, func, line,
+         netplay->self_frame_count, netplay->run_frame_count,
+         netplay->unread_frame_count,
+         netplay->read_frame_count[connection - netplay->connections + 1]);
 
    was_playing = connection->mode == NETPLAY_CONNECTION_PLAYING ||
       connection->mode == NETPLAY_CONNECTION_SLAVE;
@@ -6207,7 +6233,11 @@ static bool netplay_get_cmd(netplay_t *netplay,
                /* Problem! (Lockstep: only if we hashed this frame at all) */
                if (     buffer[1] != local_crc
                      && (local_crc || !netplay->lockstep))
+               {
+                  RARCH_WARN("[Netplay] CRC mismatch on frame %u: ours %08X, the host's %08X; requesting its state.\n",
+                        buffer[0], local_crc, buffer[1]);
                   netplay_cmd_request_savestate(netplay);
+               }
             }
             /* We'll have to check it when we catch up */
             else
@@ -6323,6 +6353,10 @@ static bool netplay_get_cmd(netplay_t *netplay,
 
             RECV(netplay->zbuffer, state_size_raw)
                return false;
+
+            RARCH_LOG("[Netplay] Received state: %u bytes (%u compressed); ours is %u bytes; we are at frame %u.\n",
+                  state_size, state_size_raw, (unsigned)netplay->state_size,
+                  netplay->self_frame_count);
 
             switch (connection->compression_supported)
             {
@@ -7811,6 +7845,7 @@ static void netplay_send_savestate(netplay_t *netplay,
    uint32_t rd, wn;
    size_t i;
    bool has_legacy_connection = false;
+   retro_time_t t0 = cpu_features_get_time_usec();
    NETPLAY_ASSERT_MODUS(NETPLAY_MODUS_INPUT_FRAME_SYNC);
 
    /* Compress it */
@@ -7822,10 +7857,15 @@ static void netplay_send_savestate(netplay_t *netplay,
          &wn, NULL))
    {
       /* Catastrophe! */
+      RARCH_ERR("[Netplay] Compressing a %u-byte state into a %u-byte buffer failed (cx %u).\n",
+            (unsigned)serial_info->size, (unsigned)netplay->zbuffer_size, cx);
       for (i = 0; i < netplay->connections_size; i++)
          netplay_hangup(netplay, &netplay->connections[i]);
       return;
    }
+   RARCH_LOG("[Netplay] Sending state for frame %u: %u bytes, %u compressed (cx %u), compressed in %d ms.\n",
+         netplay->run_frame_count, (unsigned)serial_info->size, wn, cx,
+         (int)((cpu_features_get_time_usec() - t0) / 1000));
 
    /* Send it to relevant peers */
    header[0] = htonl(NETPLAY_CMD_LOAD_SAVESTATE);
@@ -9267,10 +9307,11 @@ int16_t input_state_net(unsigned port, unsigned device,
  *
  * Returns: true (1) if successful. At present, cannot fail.
  **/
-static void netplay_disconnect(netplay_t *netplay)
+static void netplay_disconnect_at(netplay_t *netplay, const char *func, int line)
 {
    size_t i;
 
+   RARCH_LOG("[Netplay] Disconnecting the whole session from %s:%d.\n", func, line);
    for (i = 0; i < netplay->connections_size; i++)
       netplay_hangup(netplay, &netplay->connections[i]);
 
