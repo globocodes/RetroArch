@@ -2235,14 +2235,64 @@ static bool netplay_lockstep_wants_crc(netplay_t *netplay,
 }
 
 /**
+ * netplay_lockstep_mmap_regions
+ *
+ * The memory-map regions a lockstep check hashes when the core registered a
+ * map (RETRO_ENVIRONMENT_SET_MEMORY_MAPS) but exposes no SYSTEM_RAM: the
+ * ones flagged RETRO_MEMDESC_SYSTEM_RAM if there are any, else every
+ * writable region with a pointer and a length. Dolphin registers the
+ * emulated GameCube RAM this way. Constant regions (ROM) never change and
+ * are skipped. Every peer runs the same core and gets the same map.
+ *
+ * Returns: number of regions selected; *total is their size in bytes.
+ */
+static unsigned netplay_lockstep_mmap_regions(netplay_t *netplay,
+      const rarch_memory_descriptor_t **out, unsigned max, size_t *total)
+{
+   const rarch_memory_map_t *mmaps = &runloop_state_get_ptr()->system.mmaps;
+   unsigned i, n = 0;
+   bool flagged  = false;
+
+   *total = 0;
+   if (!mmaps->descriptors || !mmaps->num_descriptors)
+      return 0;
+
+   for (i = 0; i < mmaps->num_descriptors; i++)
+   {
+      const rarch_memory_descriptor_t *d = &mmaps->descriptors[i];
+      if (d->core.ptr && d->core.len
+            && (d->core.flags & RETRO_MEMDESC_SYSTEM_RAM))
+         flagged = true;
+   }
+
+   for (i = 0; i < mmaps->num_descriptors && n < max; i++)
+   {
+      const rarch_memory_descriptor_t *d = &mmaps->descriptors[i];
+      if (!d->core.ptr || !d->core.len)
+         continue;
+      if (d->core.flags & RETRO_MEMDESC_CONST)
+         continue;
+      if (flagged && !(d->core.flags & RETRO_MEMDESC_SYSTEM_RAM))
+         continue;
+      out[n++] = d;
+      *total  += d->core.len;
+   }
+   return n;
+}
+
+#define NETPLAY_LOCKSTEP_MMAP_MAX 64
+
+/**
  * netplay_lockstep_take_crc
  * @have_state          : delta->state already holds this frame's savestate
  *
- * Hash the core as it stands before this frame runs. System RAM is preferred
- * when the core exposes it: it costs no serialization (tens of MB and a
- * CPU/GPU thread sync on Dolphin) and leaves out host-side bookkeeping that
- * may legitimately differ between peers. Every peer runs the same core, so
- * every peer takes the same branch.
+ * Hash the core as it stands before this frame runs. Emulated RAM is
+ * preferred when the core exposes it, as SYSTEM_RAM or through its memory
+ * map: it costs no serialization (tens of MB and a CPU/GPU thread sync on
+ * Dolphin) and leaves out host-side bookkeeping that legitimately differs
+ * between peers, which made every whole-state check on Dolphin a mismatch
+ * and a full state hand-off. Every peer runs the same core, so every peer
+ * takes the same branch. The source is logged once per session.
  *
  * Returns: true if delta->state holds this frame's savestate afterwards.
  */
@@ -2251,15 +2301,49 @@ static bool netplay_lockstep_take_crc(netplay_t *netplay,
 {
    uint32_t crc = 0;
    retro_ctx_memory_info_t mem;
+   const rarch_memory_descriptor_t *regions[NETPLAY_LOCKSTEP_MMAP_MAX];
+   size_t   mmap_total = 0;
+   unsigned mmap_n     = 0;
 
    mem.id   = RETRO_MEMORY_SYSTEM_RAM;
    mem.data = NULL;
    mem.size = 0;
 
    if (core_get_memory(&mem) && mem.data && mem.size)
+   {
+      if (!netplay->lockstep_check_logged)
+         RARCH_LOG("[Netplay] Lockstep: desync checks hash the core's system RAM, %u bytes, every %u frames.\n",
+               (unsigned)mem.size, netplay->check_frames);
       crc = encoding_crc32(0L, (const uint8_t*)mem.data, mem.size);
+   }
+   else if ((mmap_n = netplay_lockstep_mmap_regions(netplay, regions,
+         NETPLAY_LOCKSTEP_MMAP_MAX, &mmap_total)) > 0)
+   {
+      unsigned i;
+      if (!netplay->lockstep_check_logged)
+      {
+         RARCH_LOG("[Netplay] Lockstep: desync checks hash %u memory-map region(s), %u bytes in all, every %u frames.\n",
+               mmap_n, (unsigned)mmap_total, netplay->check_frames);
+         for (i = 0; i < mmap_n; i++)
+            RARCH_LOG("[Netplay]   region %u: %u bytes at 0x%08X%s %s\n",
+                  i, (unsigned)regions[i]->core.len,
+                  (unsigned)regions[i]->core.start,
+                  (regions[i]->core.flags & RETRO_MEMDESC_SYSTEM_RAM)
+                     ? " (system RAM)" : "",
+                  regions[i]->core.addrspace ? regions[i]->core.addrspace : "");
+      }
+      /* One running CRC over the regions, in map order */
+      for (i = 0; i < mmap_n; i++)
+         crc = encoding_crc32(crc, (const uint8_t*)regions[i]->core.ptr,
+               regions[i]->core.len);
+      /* Read as "we hashed something" below */
+      mem.data = (void*)regions[0]->core.ptr;
+   }
    else if (netplay->state_size && !netplay->state_crc_unusable)
    {
+      if (!netplay->lockstep_check_logged)
+         RARCH_LOG("[Netplay] Lockstep: desync checks hash the whole savestate (%u bytes; the core exposes no RAM), every %u frames.\n",
+               (unsigned)netplay->state_size, netplay->check_frames);
       if (!have_state && netplay_lockstep_fit_state(netplay))
       {
          retro_ctx_serialize_info_t serial_info = {0};
@@ -2279,8 +2363,9 @@ static bool netplay_lockstep_take_crc(netplay_t *netplay,
    if (!crc && (mem.data || have_state))
       crc = 1;
 
-   delta->local_crc      = crc;
-   delta->have_local_crc = true;
+   delta->local_crc              = crc;
+   delta->have_local_crc         = true;
+   netplay->lockstep_check_logged = true;
    return have_state;
 }
 
