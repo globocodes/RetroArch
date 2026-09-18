@@ -4934,7 +4934,10 @@ static void netplay_announce_play_spectate(netplay_t *netplay,
 #ifdef HAVE_CHEEVOS
    rcheevos_spectating_changed();
 
-   if (!netplay->is_server && !netplay_is_spectating()) /* force sync of achievement state */
+   /* Lockstep: the joiner loaded the host's state during the handshake and
+    * a Dolphin-sized one costs the host seconds to serialize and compress
+    * again, so do not ask for it a second time. */
+   if (!netplay->is_server && !netplay_is_spectating() && !netplay->lockstep) /* force sync of achievement state */
       netplay_cmd_request_savestate(netplay);
 #endif
 
@@ -6322,8 +6325,41 @@ static bool netplay_get_cmd(netplay_t *netplay,
 
             if (frame != load_frame_count)
             {
-               RARCH_ERR("[Netplay] Netplay state load out of order!\n");
-               return netplay_cmd_nak(netplay, connection);
+               /* A host answers a state request from where it is, and it
+                * labels the state with the frame it is inputting for, whose
+                * input it may already have sent us (it does whenever the
+                * request found it stalled, waiting for our input). Lockstep
+                * keeps every frame's real input in the buffer, so as long as
+                * that frame is still there we can load the state at it and
+                * re-run from there; nothing is guessed. */
+               bool found = false;
+
+               if (     netplay->lockstep
+                     && frame < load_frame_count
+                     && load_frame_count - frame < netplay->buffer_size)
+               {
+                  size_t   ptr  = load_ptr;
+                  uint32_t back = load_frame_count - frame;
+
+                  while (back--)
+                     ptr = PREV_PTR(ptr);
+
+                  if (     netplay->buffer[ptr].used
+                        && netplay->buffer[ptr].frame == frame)
+                  {
+                     load_ptr         = ptr;
+                     load_frame_count = frame;
+                     found            = true;
+                  }
+               }
+
+               if (!found)
+               {
+                  RARCH_ERR("[Netplay] Netplay state load out of order: state is for frame %u, the host's input has reached frame %u (we run %u, self %u).\n",
+                        frame, load_frame_count, netplay->run_frame_count,
+                        netplay->self_frame_count);
+                  return netplay_cmd_nak(netplay, connection);
+               }
             }
 
             if (!netplay_delta_frame_ready(netplay,
@@ -6356,9 +6392,12 @@ static bool netplay_get_cmd(netplay_t *netplay,
             RECV(netplay->zbuffer, state_size_raw)
                return false;
 
-            RARCH_LOG("[Netplay] Received state: %u bytes (%u compressed); ours is %u bytes; we are at frame %u.\n",
-                  state_size, state_size_raw, (unsigned)netplay->state_size,
-                  netplay->self_frame_count);
+            RARCH_LOG("[Netplay] Received state for frame %u: %u bytes (%u compressed); ours is %u bytes; we run %u, self %u%s.\n",
+                  frame, state_size, state_size_raw,
+                  (unsigned)netplay->state_size, netplay->run_frame_count,
+                  netplay->self_frame_count,
+                  (frame < netplay->run_frame_count)
+                     ? " (rewinding to it and re-running from there)" : "");
 
             switch (connection->compression_supported)
             {
