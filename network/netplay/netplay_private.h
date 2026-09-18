@@ -718,6 +718,11 @@ struct netplay
    void *lockstep_state;
    /* When we began waiting for input, for the stall-out timer */
    retro_time_t lockstep_stall_time;
+   /* Consecutive frames on which serializing for a joining peer failed */
+   uint32_t lockstep_state_failures;
+   /* Client: the host's core state differs in size from ours, so a CRC over
+    * the serialized state cannot agree; only a RAM CRC is meaningful */
+   bool state_crc_unusable;
 };
 
 void video_frame_net(const void *data,

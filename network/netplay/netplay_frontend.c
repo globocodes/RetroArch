@@ -233,6 +233,8 @@ net_driver_state_t *networking_state_get_ptr(void)
 static bool netplay_build_savestate(netplay_t* netplay, retro_ctx_serialize_info_t* serial_info, bool force_capture_achievements);
 static bool netplay_process_savestate(netplay_t* netplay, retro_ctx_serialize_info_t* serial_info);
 static bool netplay_grow_states(netplay_t *netplay, size_t state_size);
+static bool netplay_init_socket_buffers(netplay_t *netplay);
+static bool netplay_lockstep_fit_state(netplay_t *netplay);
 
 /* Align to 8-byte boundary */
 #define CONTENT_ALIGN_SIZE(size) ((((size) + 7) & ~7))
@@ -2248,21 +2250,25 @@ static bool netplay_lockstep_take_crc(netplay_t *netplay,
 
    if (core_get_memory(&mem) && mem.data && mem.size)
       crc = encoding_crc32(0L, (const uint8_t*)mem.data, mem.size);
-   else if (netplay->state_size)
+   else if (netplay->state_size && !netplay->state_crc_unusable)
    {
-      if (!have_state)
+      if (!have_state && netplay_lockstep_fit_state(netplay))
       {
          retro_ctx_serialize_info_t serial_info = {0};
          serial_info.data = delta->state;
          have_state       = netplay_build_savestate(netplay,
                &serial_info, false);
+         if (!have_state)
+            RARCH_WARN("[Netplay] Lockstep: core failed to serialize for the check on frame %u; no CRC this time.\n",
+                  delta->frame);
       }
       if (have_state)
          crc = netplay_delta_frame_crc(netplay, delta);
    }
 
-   /* 0 means "no CRC" on the wire and in delta->crc */
-   if (!crc)
+   /* 0 means "no CRC" on the wire and in delta->crc, and a frame we could
+    * not hash must read as one we have no CRC for, not as a mismatch. */
+   if (!crc && (mem.data || have_state))
       crc = 1;
 
    delta->local_crc      = crc;
@@ -3838,8 +3844,38 @@ static bool netplay_sync_pre_frame(netplay_t *netplay)
             /* No rollback, so no per-frame state: serialize only to hand a
              * state to a peer, or when a check frame has no cheaper hash. */
             if (send_state)
-               have_state = netplay_build_savestate(netplay,
-                     &serial_info, false);
+            {
+               retro_time_t t0 = cpu_features_get_time_usec();
+
+               /* A core's state may have grown since it was measured
+                * (Dolphin's does): re-measure and make room first. */
+               if (netplay_lockstep_fit_state(netplay))
+               {
+                  serial_info.data = delta->state;
+                  have_state       = netplay_build_savestate(netplay,
+                        &serial_info, false);
+               }
+
+               if (have_state)
+               {
+                  netplay->lockstep_state_failures = 0;
+                  RARCH_LOG("[Netplay] Lockstep: serialized %u bytes for a joining peer in %d ms.\n",
+                        (unsigned)netplay->coremem_size,
+                        (int)((cpu_features_get_time_usec() - t0) / 1000));
+               }
+               else
+               {
+                  /* Do not tear the session down over one failed serialize:
+                   * the joiner waits (lockstep stall, 30 s); try again next
+                   * frame, give up on the send after a while. */
+                  netplay->lockstep_state_failures++;
+                  RARCH_ERR("[Netplay] Lockstep: core failed to serialize %u bytes for a joining peer (attempt %u).\n",
+                        (unsigned)netplay->coremem_size,
+                        netplay->lockstep_state_failures);
+                  if (netplay->lockstep_state_failures < 180)
+                     send_state = false;
+               }
+            }
             /* (serial_info is only read below when send_state built it) */
             if (netplay_lockstep_wants_crc(netplay, delta))
                netplay_lockstep_take_crc(netplay, delta, have_state);
@@ -5533,6 +5569,23 @@ static bool netplay_get_cmd(netplay_t *netplay,
 
    cmd_size = ntohl(cmd_size);
 
+   /* A command must fit in the receive buffer whole or it can never complete.
+    * A savestate from a host whose core state grew past what we measured
+    * (Dolphin) may not, so make room for it up front. */
+   if (cmd_size + 2 * sizeof(uint32_t) > connection->recv_packet_buffer.bufsz)
+   {
+      if (     cmd_size > (UINT32_C(1) << 30)
+            || !netplay_resize_socket_buffer(&connection->recv_packet_buffer,
+                  cmd_size + 2 * sizeof(uint32_t) + NETPLAY_MAX_STALL_FRAMES * 16))
+      {
+         RARCH_ERR("[Netplay] Command %X of %u bytes does not fit our receive buffer.\n",
+               cmd, cmd_size);
+         return netplay_cmd_nak(netplay, connection);
+      }
+      RARCH_LOG("[Netplay] Grew receive buffer for a %u-byte command %X.\n",
+            cmd_size, cmd);
+   }
+
 #ifdef DEBUG_NETPLAY_STEPS
    RARCH_LOG("[Netplay] Received netplay command %X (%u) from %u\n", cmd, cmd_size,
          (unsigned) (connection - netplay->connections));
@@ -6253,8 +6306,19 @@ static bool netplay_get_cmd(netplay_t *netplay,
 
             if (state_size_raw > netplay->zbuffer_size)
             {
-               RARCH_ERR("[Netplay] Netplay state load with an unexpected save state size.\n");
-               return netplay_cmd_nak(netplay, connection);
+               /* The host's state is bigger than ours was when measured
+                * (variable-size cores such as Dolphin): make room. */
+               uint8_t *zbuffer = (uint8_t*)realloc(netplay->zbuffer,
+                     state_size_raw);
+               if (!zbuffer)
+               {
+                  RARCH_ERR("[Netplay] Netplay state load with an unexpected save state size.\n");
+                  return netplay_cmd_nak(netplay, connection);
+               }
+               RARCH_LOG("[Netplay] Incoming state of %u bytes exceeds our %u-byte buffer; growing.\n",
+                     (unsigned)state_size_raw, (unsigned)netplay->zbuffer_size);
+               netplay->zbuffer      = zbuffer;
+               netplay->zbuffer_size = state_size_raw;
             }
 
             RECV(netplay->zbuffer, state_size_raw)
@@ -6287,7 +6351,23 @@ static bool netplay_get_cmd(netplay_t *netplay,
                ctrans->decompression_stream,
                true, &rd, &wn, NULL);
 
-            if (memcmp(netplay->buffer[load_ptr].state, "NETPLAY", 7) != 0)
+            if (memcmp(netplay->buffer[load_ptr].state, "NETPLAY", 7) == 0)
+            {
+               /* The host's core state size is in the MEM block header. A
+                * CRC over states of different sizes can never match, so a
+                * lockstep peer must not resync over it, or it reloads the
+                * host's state at every check. */
+               const uint8_t *hdr    = (const uint8_t*)netplay->buffer[load_ptr].state + 8;
+               uint32_t peer_coremem = hdr[4] | (hdr[5] << 8) | (hdr[6] << 16)
+                     | ((uint32_t)hdr[7] << 24);
+               bool unusable         = peer_coremem != netplay->coremem_size;
+
+               if (unusable && !netplay->state_crc_unusable)
+                  RARCH_WARN("[Netplay] Host state is %u bytes, ours %u: state CRC checks are off until they agree (RAM checks still run).\n",
+                        peer_coremem, (unsigned)netplay->coremem_size);
+               netplay->state_crc_unusable = unusable;
+            }
+            else
             {
                if (state_size != netplay->coremem_size)
                {
@@ -7310,6 +7390,44 @@ static bool netplay_grow_states(netplay_t *netplay, size_t state_size)
          return false;
    }
    return true;
+}
+
+/**
+ * netplay_lockstep_fit_state
+ *
+ * Re-measure the core's state and, if it grew past what was allocated at
+ * init, grow the state buffer, the compression buffer and the socket buffers
+ * to match. Returns false only when memory could not be had.
+ */
+static bool netplay_lockstep_fit_state(netplay_t *netplay)
+{
+   size_t coremem = core_serialize_size_special();
+   size_t state_size;
+   uint8_t *zbuffer;
+
+   if (!coremem || coremem <= netplay->coremem_size)
+      return true;
+
+   state_size = netplay->state_size
+      + CONTENT_ALIGN_SIZE(coremem)
+      - CONTENT_ALIGN_SIZE(netplay->coremem_size);
+
+   RARCH_LOG("[Netplay] Lockstep: core state grew from %u to %u bytes; resizing.\n",
+         (unsigned)netplay->coremem_size, (unsigned)coremem);
+
+   if (!netplay_grow_states(netplay, state_size))
+      return false;
+   netplay->coremem_size       = coremem;
+   /* Sizes may agree again now; the next state load re-evaluates */
+   netplay->state_crc_unusable = false;
+
+   zbuffer = (uint8_t*)realloc(netplay->zbuffer, state_size * 2);
+   if (!zbuffer)
+      return false;
+   netplay->zbuffer      = zbuffer;
+   netplay->zbuffer_size = state_size * 2;
+
+   return netplay_init_socket_buffers(netplay);
 }
 
 static bool netplay_init_serialization(netplay_t *netplay)
