@@ -722,6 +722,29 @@ struct netplay
    uint32_t lockstep_state_failures;
    /* The check-frame hash source has been logged for this session */
    bool lockstep_check_logged;
+
+   /* Lockstep session metrics, logged every NETPLAY_LOCKSTEP_STATS_FRAMES
+    * frames that ran: where the wall time went (core, netplay, waiting for
+    * the peer), so a hitch can be blamed on the emulator or the link. */
+   struct
+   {
+      retro_time_t window_start;   /* 0: session not started */
+      retro_time_t last_call;
+      retro_time_t core_start;
+      retro_time_t cur_wait;
+      retro_time_t wait_peer;
+      retro_time_t wait_peer_max;
+      retro_time_t wait_other;
+      retro_time_t core_sum;
+      retro_time_t core_max;
+      retro_time_t work_sum;
+      retro_time_t work_max;
+      uint32_t first_frame;
+      uint32_t frames;
+      uint32_t slow_frames;
+      uint32_t stalls;
+      bool was_stalled;
+   } lockstep_stats;
    /* Client: the host's core state differs in size from ours, so a CRC over
     * the serialized state cannot agree; only a RAM CRC is meaningful */
    bool state_crc_unusable;

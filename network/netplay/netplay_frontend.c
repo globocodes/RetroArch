@@ -2281,6 +2281,32 @@ static unsigned netplay_lockstep_mmap_regions(netplay_t *netplay,
 }
 
 #define NETPLAY_LOCKSTEP_MMAP_MAX 64
+#define NETPLAY_LOCKSTEP_CHUNKS   32
+
+/**
+ * netplay_lockstep_log_chunks
+ *
+ * Log the CRC of each 1/32 of the memory a desync check hashed.
+ */
+static void netplay_lockstep_log_chunks(uint32_t frame,
+      const uint8_t *data, size_t len)
+{
+   char   line[NETPLAY_LOCKSTEP_CHUNKS * 9 + 1];
+   size_t chunk = (len + NETPLAY_LOCKSTEP_CHUNKS - 1) / NETPLAY_LOCKSTEP_CHUNKS;
+   size_t off, pos = 0;
+
+   if (!data || !chunk)
+      return;
+   line[0] = '\0';
+   for (off = 0; off < len && pos + 10 <= sizeof(line); off += chunk)
+   {
+      size_t n = (len - off < chunk) ? (len - off) : chunk;
+      pos += snprintf(line + pos, sizeof(line) - pos, " %08lX",
+            (unsigned long)encoding_crc32(0L, data + off, n));
+   }
+   RARCH_LOG("[Netplay] Check frame %u, %u-byte chunks:%s\n",
+         frame, (unsigned)chunk, line);
+}
 
 /**
  * netplay_lockstep_take_crc
@@ -2357,6 +2383,15 @@ static bool netplay_lockstep_take_crc(netplay_t *netplay,
       if (have_state)
          crc = netplay_delta_frame_crc(netplay, delta);
    }
+
+   /* Both peers log the same chunk hashes for the same frame: laid side by
+    * side, the two logs say how much of RAM differs and where. */
+   if (mmap_n)
+      netplay_lockstep_log_chunks(delta->frame,
+            (const uint8_t*)regions[0]->core.ptr, regions[0]->core.len);
+   else if (mem.data && mem.size)
+      netplay_lockstep_log_chunks(delta->frame, (const uint8_t*)mem.data,
+            mem.size);
 
    /* 0 means "no CRC" on the wire and in delta->crc, and a frame we could
     * not hash must read as one we have no CRC for, not as a mismatch. */
@@ -8511,7 +8546,14 @@ static bool get_self_input_state(
    NETPLAY_ASSERT_MODUS(NETPLAY_MODUS_INPUT_FRAME_SYNC);
 
    if (!netplay_delta_frame_ready(netplay, ptr, netplay->self_frame_count))
+   {
+      RARCH_WARN("[Netplay] No free input slot for our frame %u: slot %u still holds frame %u, replayed only up to %u (run %u, unread %u, server %u, buffer %u).\n",
+            netplay->self_frame_count, (unsigned)netplay->self_ptr,
+            ptr->frame, netplay->other_frame_count,
+            netplay->run_frame_count, netplay->unread_frame_count,
+            netplay->server_frame_count, (unsigned)netplay->buffer_size);
       return false;
+   }
 
    /* We've already read this frame! */
    if (ptr->have_local)
@@ -9482,7 +9524,7 @@ static void netplay_flush_output(netplay_t *netplay)
  * Returns: true if the frontend is cleared to emulate the frame,
  * false if we're stalled or paused
  **/
-static bool netplay_pre_frame(netplay_t *netplay)
+static bool netplay_pre_frame_sync(netplay_t *netplay)
 {
    /* FIXME: This is an ugly way to learn we're not paused anymore */
    if (netplay->local_paused)
@@ -9555,6 +9597,149 @@ static bool netplay_pre_frame(netplay_t *netplay)
    return true;
 }
 
+#define NETPLAY_LOCKSTEP_STATS_FRAMES 600
+
+/**
+ * netplay_lockstep_stats_options
+ *
+ * Log the core's option values once per session: two peers that disagree on
+ * one (CPU engine, dual core) cannot stay in sync, and only the logs of both
+ * can show it.
+ */
+static void netplay_lockstep_stats_options(void)
+{
+   size_t i;
+   core_option_manager_t *opts = runloop_state_get_ptr()->core_options;
+
+   if (!opts)
+      return;
+   for (i = 0; i < opts->size; i++)
+   {
+      const char *val = core_option_manager_get_val(opts, i);
+      RARCH_LOG("[Netplay] Core option %s = %s\n",
+            opts->opts[i].key ? opts->opts[i].key : "?", val ? val : "?");
+   }
+}
+
+/**
+ * netplay_lockstep_stats
+ * @ran                  : this call let a frame run (false: we stalled)
+ * @work                 : time this call spent inside netplay itself
+ *
+ * Account one pre-frame call of a lockstep session with a peer, and log the
+ * totals every NETPLAY_LOCKSTEP_STATS_FRAMES frames.
+ */
+static void netplay_lockstep_stats(netplay_t *netplay, bool ran,
+      retro_time_t now, retro_time_t work)
+{
+   retro_time_t dt;
+
+   if (     !netplay->lockstep
+         ||  netplay->modus != NETPLAY_MODUS_INPUT_FRAME_SYNC
+         || (netplay->is_server
+               ? netplay->connected_players <= 1
+               : netplay->self_mode < NETPLAY_CONNECTION_CONNECTED))
+   {
+      netplay->lockstep_stats.window_start = 0;
+      return;
+   }
+
+   if (!netplay->lockstep_stats.window_start)
+   {
+      memset(&netplay->lockstep_stats, 0, sizeof(netplay->lockstep_stats));
+      netplay->lockstep_stats.window_start = now;
+      netplay->lockstep_stats.last_call    = now;
+      netplay->lockstep_stats.first_frame  = netplay->run_frame_count;
+      RARCH_LOG("[Netplay] Stats: session starts at frame %u, input latency %u frames, check every %u frames.\n",
+            netplay->run_frame_count,
+            (unsigned)netplay->input_latency_frames, netplay->check_frames);
+      netplay_lockstep_stats_options();
+   }
+
+   dt                                 = now - netplay->lockstep_stats.last_call;
+   netplay->lockstep_stats.last_call  = now;
+
+   if (!ran)
+   {
+      /* The time since the previous call was spent waiting */
+      if (     netplay->stall == NETPLAY_STALL_LOCKSTEP
+            || netplay->stall == NETPLAY_STALL_RUNNING_FAST
+            || netplay->remote_paused)
+      {
+         netplay->lockstep_stats.wait_peer += dt;
+         netplay->lockstep_stats.cur_wait  += dt;
+         if (netplay->lockstep_stats.cur_wait
+               > netplay->lockstep_stats.wait_peer_max)
+            netplay->lockstep_stats.wait_peer_max =
+               netplay->lockstep_stats.cur_wait;
+         if (!netplay->lockstep_stats.was_stalled)
+            netplay->lockstep_stats.stalls++;
+         netplay->lockstep_stats.was_stalled = true;
+      }
+      else
+         netplay->lockstep_stats.wait_other += dt;
+      return;
+   }
+
+   /* A stalled call's time is already counted as waiting */
+   netplay->lockstep_stats.work_sum   += work;
+   if (work > netplay->lockstep_stats.work_max)
+      netplay->lockstep_stats.work_max = work;
+   netplay->lockstep_stats.was_stalled = false;
+   netplay->lockstep_stats.cur_wait    = 0;
+   netplay->lockstep_stats.core_start  = now;
+
+   if (++netplay->lockstep_stats.frames >= NETPLAY_LOCKSTEP_STATS_FRAMES)
+   {
+      unsigned frames  = netplay->lockstep_stats.frames;
+      unsigned wall_ms = (unsigned)((now
+            - netplay->lockstep_stats.window_start) / 1000);
+      /* A client re-measures its ping as it goes; a host only has the
+       * first peer's handshake value. */
+      int      ping    = netplay->connections_size
+            ? netplay->connections[0].ping : -1;
+
+      RARCH_LOG("[Netplay] Stats: frames %u-%u in %u ms (%u.%u fps). Core and display: avg %u us, max %u ms, %u frames over 20 ms. Netplay work: avg %u us, max %u ms. Waiting for the peer: %u ms in %u stalls, longest %u ms. Other waits: %u ms. Ping %d ms.\n",
+            netplay->lockstep_stats.first_frame, netplay->run_frame_count,
+            wall_ms,
+            wall_ms ? (unsigned)(frames * 1000u / wall_ms) : 0,
+            wall_ms ? (unsigned)((frames * 10000u / wall_ms) % 10) : 0,
+            (unsigned)(netplay->lockstep_stats.core_sum / frames),
+            (unsigned)(netplay->lockstep_stats.core_max / 1000),
+            netplay->lockstep_stats.slow_frames,
+            (unsigned)(netplay->lockstep_stats.work_sum / frames),
+            (unsigned)(netplay->lockstep_stats.work_max / 1000),
+            (unsigned)(netplay->lockstep_stats.wait_peer / 1000),
+            netplay->lockstep_stats.stalls,
+            (unsigned)(netplay->lockstep_stats.wait_peer_max / 1000),
+            (unsigned)(netplay->lockstep_stats.wait_other / 1000),
+            ping);
+
+      memset(&netplay->lockstep_stats, 0, sizeof(netplay->lockstep_stats));
+      netplay->lockstep_stats.window_start = now;
+      netplay->lockstep_stats.last_call    = now;
+      netplay->lockstep_stats.core_start   = now;
+      netplay->lockstep_stats.first_frame  = netplay->run_frame_count;
+   }
+}
+
+/**
+ * netplay_pre_frame:
+ *
+ * netplay_pre_frame_sync, timed for the lockstep session metrics.
+ */
+static bool netplay_pre_frame(netplay_t *netplay)
+{
+   retro_time_t start = cpu_features_get_time_usec();
+   bool         ran   = netplay_pre_frame_sync(netplay);
+   retro_time_t now   = cpu_features_get_time_usec();
+
+   /* The sync step frees the session when it disconnects */
+   if (networking_driver_st.data == netplay)
+      netplay_lockstep_stats(netplay, ran, now, now - start);
+   return ran;
+}
+
 /**
  * netplay_post_frame:
  * @netplay              : pointer to netplay object
@@ -9565,6 +9750,23 @@ static bool netplay_pre_frame(netplay_t *netplay)
  **/
 static void netplay_post_frame(netplay_t *netplay)
 {
+   if (netplay->lockstep_stats.window_start
+         && netplay->lockstep_stats.core_start)
+   {
+      retro_time_t core = cpu_features_get_time_usec()
+         - netplay->lockstep_stats.core_start;
+      netplay->lockstep_stats.core_sum += core;
+      if (core > netplay->lockstep_stats.core_max)
+         netplay->lockstep_stats.core_max = core;
+      /* retro_run presents the frame too, so a vsynced 60 Hz frame reads
+       * as about 16.7 ms: count the ones that clearly missed it. */
+      if (core > 20000)
+         netplay->lockstep_stats.slow_frames++;
+      netplay->lockstep_stats.core_start = 0;
+      /* Waiting is measured from here, not from before the core ran */
+      netplay->lockstep_stats.last_call  = cpu_features_get_time_usec();
+   }
+
    /* When a core uses the netpacket interface frames are not synced */
    if (netplay->modus == NETPLAY_MODUS_INPUT_FRAME_SYNC)
    {
