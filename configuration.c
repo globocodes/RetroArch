@@ -2224,6 +2224,7 @@ static struct config_bool_setting *populate_settings_bool(
    SETTING_BOOL("netplay_allow_slaves",          &settings->bools.netplay_allow_slaves, true, DEFAULT_NETPLAY_ALLOW_SLAVES, false);
    SETTING_BOOL("netplay_lockstep",              &settings->bools.netplay_lockstep, true, DEFAULT_NETPLAY_LOCKSTEP, false);
    SETTING_BOOL("netplay_analog_joypads",        &settings->bools.netplay_analog_joypads, true, DEFAULT_NETPLAY_ANALOG_JOYPADS, false);
+   SETTING_BOOL("frame_time_log",                &settings->bools.frame_time_log, true, DEFAULT_FRAME_TIME_LOG, false);
    SETTING_BOOL("netplay_require_slaves",        &settings->bools.netplay_require_slaves, true, DEFAULT_NETPLAY_REQUIRE_SLAVES, false);
    SETTING_BOOL("netplay_use_mitm_server",       &settings->bools.netplay_use_mitm_server, true, DEFAULT_NETPLAY_USE_MITM_SERVER, false);
    SETTING_BOOL("netplay_request_device_p1",     &settings->bools.netplay_request_devices[0], true, false, false);

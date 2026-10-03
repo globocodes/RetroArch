@@ -171,6 +171,9 @@ typedef NS_ENUM(NSInteger, LibretroNetplayEvent) {
 - (void)setFastforwardFrameSkip:(BOOL)frameSkip;
 - (void)set3DSCustomLayout:(NSString *_Nullable)layout;
 - (void)setLibretroLogMonitor:(BOOL)enable;
+/// Manic MP: write one line to RetroArch's log (the Dolphin session log in
+/// Documents/Netplay Logs) as "[Input] <line>". Safe from any thread.
+- (void)logDiagnosticsLine:(NSString *_Nonnull)line;
 - (void)loadAmiibo:(NSString *_Nonnull)path;
 - (BOOL)isSearchingAmiibo;
 - (void)registerAzaharKeyboard:(void(^ _Nullable)(AzaharKeyboardConfig *_Nonnull config))callback;

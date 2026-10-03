@@ -1338,6 +1338,10 @@
  * carries the digital buttons of a RETRO_DEVICE_JOYPAD port. */
 #define DEFAULT_NETPLAY_ANALOG_JOYPADS false
 
+/* Manic MP: log frame timing of the frontend's run loop every 10 s
+ * ("[Frame] Stats:" in the session log), for input-lag investigations. */
+#define DEFAULT_FRAME_TIME_LOG false
+
 /* Require connections only in slave mode */
 #define DEFAULT_NETPLAY_REQUIRE_SLAVES false
 

@@ -908,6 +908,7 @@ typedef struct settings
       bool netplay_allow_slaves;
       bool netplay_lockstep;
       bool netplay_analog_joypads;
+      bool frame_time_log;
       bool netplay_require_slaves;
       bool netplay_nat_traversal;
       bool netplay_use_mitm_server;

@@ -27,6 +27,7 @@
 #include <queues/task_queue.h>
 #include <string/stdstring.h>
 #include <retro_timers.h>
+#include <features/features_cpu.h>
 
 #include "cocoa/cocoa_common.h"
 #include "cocoa/apple_platform.h"
@@ -163,11 +164,75 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
    return [textures[iconName] unsignedLongValue];
 }
 
+/* Manic MP: frame timing for the session log (frame_time_log).
+ *
+ * The frontend's frame runs here, on the main thread, once per run-loop pass.
+ * A slow core shows up as long iterations; a main thread kept busy elsewhere
+ * (UIKit, controller delivery, the app) shows up as long gaps between them.
+ * Totals are logged every 10 s as "[Frame] Stats:". */
+typedef struct
+{
+   retro_time_t window_start;   /* 0 = no open window */
+   retro_time_t last_end;
+   retro_time_t iter_sum;
+   retro_time_t iter_max;
+   retro_time_t gap_max;
+   unsigned     iterations;
+   unsigned     over_20ms;
+} manic_frame_stats_t;
+
+static manic_frame_stats_t frame_stats;
+
+static void manic_frame_stats_account(retro_time_t start, retro_time_t end)
+{
+   retro_time_t dt = end - start;
+
+   if (!frame_stats.window_start)
+   {
+      memset(&frame_stats, 0, sizeof(frame_stats));
+      frame_stats.window_start = start;
+   }
+   else
+   {
+      retro_time_t gap = start - frame_stats.last_end;
+      if (gap > frame_stats.gap_max)
+         frame_stats.gap_max = gap;
+   }
+   frame_stats.last_end = end;
+   frame_stats.iterations++;
+   frame_stats.iter_sum += dt;
+   if (dt > frame_stats.iter_max)
+      frame_stats.iter_max = dt;
+   if (dt > 20000)
+      frame_stats.over_20ms++;
+
+   if (end - frame_stats.window_start >= 10 * 1000000)
+   {
+      retro_time_t window = end - frame_stats.window_start;
+      unsigned     rate10 = (unsigned)(frame_stats.iterations * 10000000ULL / (window ? window : 1));
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Main thread elsewhere: longest gap %u ms.\n",
+            frame_stats.iterations,
+            (unsigned)(window / 1000),
+            rate10 / 10, rate10 % 10,
+            (unsigned)(frame_stats.iter_sum / (frame_stats.iterations ? frame_stats.iterations : 1)),
+            (unsigned)(frame_stats.iter_max / 1000),
+            frame_stats.over_20ms,
+            (unsigned)(frame_stats.gap_max / 1000));
+      frame_stats.window_start = 0;
+   }
+}
+
 static void rarch_draw_observer(CFRunLoopObserverRef observer,
     CFRunLoopActivity activity, void *info)
 {
    uint32_t runloop_flags;
-   int          ret   = runloop_iterate();
+   settings_t  *settings  = config_get_ptr();
+   bool        log_frames = settings && settings->bools.frame_time_log;
+   retro_time_t start     = log_frames ? cpu_features_get_time_usec() : 0;
+   int          ret       = runloop_iterate();
+
+   if (log_frames)
+      manic_frame_stats_account(start, cpu_features_get_time_usec());
 
    if (ret == -1)
    {
