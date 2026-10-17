@@ -142,6 +142,9 @@ typedef NS_ENUM(NSInteger, LibretroNetplayEvent) {
 - (void)addCheatCode:(NSString *_Nonnull)code index:(unsigned)index enable:(BOOL)enable;
 - (void)resetCheatCode;
 + (BOOL)JITAvailable;
+/// Manic MP: JIT was available once this launch (StikDebug attached) and is not any more,
+/// on hardware where it needs the debugger attached (iOS 26 on A15/M2 or newer).
++ (BOOL)JITDebuggerDetached;
 - (NSString * _Nullable)coreConfigValue:(NSString * _Nonnull)coreName key:(NSString * _Nonnull)key;
 - (NSString * _Nullable)libretroConfigValue:(NSString * _Nonnull)key;
 - (void)setRespectSilentMode:(BOOL)respect;

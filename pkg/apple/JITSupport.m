@@ -19,6 +19,11 @@
 #include <mach-o/getsect.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
 
 #include <string/stdstring.h>
 #include <file/file_path.h>
@@ -46,6 +51,57 @@ static void *exception_handler(void *argument) {
 static bool jb_has_debugger_attached(void) {
     int flags;
     return !csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) && flags & CS_DEBUGGED;
+}
+
+#ifndef P_TRACED
+#define P_TRACED 0x00000800 /* sys/proc.h: a tracer holds this process */
+#endif
+
+/* Manic MP: a debugger is attached at this moment. CS_DEBUGGED above is sticky
+ * ("is currently or has previously been debugged"); P_TRACED is set while a
+ * tracer holds the process and cleared when it detaches or exits. */
+static bool jb_has_live_tracer(void) {
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4]  = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    memset(&info, 0, sizeof(info));
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0)
+        return false;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
+/* Manic MP: iOS 26 on A15/M2 or newer (machine major >= 14) runs the Trusted
+ * Execution Monitor. There a process executes unsigned pages only while a
+ * debugger is attached: the cores ask the attached StikDebug to make each JIT
+ * region executable (brk, universal.js), and once StikDebug is gone the request
+ * is answered by nobody. Dolphin then booted with JIT ARM64 and died on the
+ * first block of its code buffer (SIGBUS, KERN_CODESIGN_ERROR) because
+ * CS_DEBUGGED still said JIT was available. On PPL hardware CS_DEBUGGED alone
+ * keeps JIT working after the debugger detaches. Same rule as hasTXM in the app. */
+static bool jit_needs_live_debugger(void) {
+    static bool txm = false;
+    static dispatch_once_t txmOnce = 0;
+    dispatch_once(&txmOnce, ^{
+        if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion < 26)
+            return;
+        struct utsname systemInfo;
+        if (uname(&systemInfo) != 0)
+            return;
+        const char *digits = NULL;
+        if (strncmp(systemInfo.machine, "iPhone", 6) == 0)
+            digits = systemInfo.machine + 6;
+        else if (strncmp(systemInfo.machine, "iPad", 4) == 0)
+            digits = systemInfo.machine + 4;
+        if (!digits || !strchr(digits, ','))
+            return;
+        txm = atoi(digits) >= 14;
+    });
+    return txm;
+}
+
+bool jit_debugger_detached(void)
+{
+    return jit_needs_live_debugger() && jb_has_debugger_attached() && !jb_has_live_tracer();
 }
 
 bool jb_enable_ptrace_hack(void) {
@@ -129,6 +185,16 @@ bool jit_available(void)
       }
    });
 
+   if (canOpenApps || dylded || doped)
+      return true;
+
    /* the debugger could be attached at any time, its value can't be cached */
-   return canOpenApps || dylded || doped || jb_has_debugger_attached();
+   if (!jb_has_debugger_attached())
+      return false;
+
+   /* Manic MP: on TXM the debugger has to be attached right now, not just once. */
+   if (jit_needs_live_debugger() && !jb_has_live_tracer())
+      return false;
+
+   return true;
 }

@@ -683,6 +683,10 @@ static void netplay_start_task_pump_if_paused(BOOL advertise)
     return jit_available();
 }
 
++ (BOOL)JITDebuggerDetached {
+    return jit_debugger_detached();
+}
+
 - (NSString * _Nullable)libretroConfigValue:(NSString * _Nonnull)key {
     return [[self getRetroArch] libretroConfigValue:key];
 }
