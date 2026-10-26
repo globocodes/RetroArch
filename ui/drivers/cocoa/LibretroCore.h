@@ -177,6 +177,9 @@ typedef NS_ENUM(NSInteger, LibretroNetplayEvent) {
 /// Manic MP: write one line to RetroArch's log (the Dolphin session log in
 /// Documents/Netplay Logs) as "[Input] <line>". Safe from any thread.
 - (void)logDiagnosticsLine:(NSString *_Nonnull)line;
+/// Manic MP: the same, as "[<tag>] <line>", for the app's own events in the
+/// session log (device state, auto save states, shader cache growth).
+- (void)logDiagnosticsEvent:(NSString *_Nonnull)tag line:(NSString *_Nonnull)line;
 - (void)loadAmiibo:(NSString *_Nonnull)path;
 - (BOOL)isSearchingAmiibo;
 - (void)registerAzaharKeyboard:(void(^ _Nullable)(AzaharKeyboardConfig *_Nonnull config))callback;

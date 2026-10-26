@@ -33,6 +33,7 @@
 #include "cocoa/apple_platform.h"
 #include "../ui_companion_driver.h"
 #include "../../audio/audio_driver.h"
+#include "../../audio/drivers/coreaudio3_diag.h"
 #include "../../configuration.h"
 #include "../../frontend/frontend.h"
 #include "../../input/drivers/cocoa_input.h"
@@ -169,55 +170,157 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
  * The frontend's frame runs here, on the main thread, once per run-loop pass.
  * A slow core shows up as long iterations; a main thread kept busy elsewhere
  * (UIKit, controller delivery, the app) shows up as long gaps between them.
- * Totals are logged every 10 s as "[Frame] Stats:". */
+ * Totals are logged every 10 s as "[Frame] Stats:". An iteration or gap of
+ * MANIC_STALL_USEC or more is also logged the moment it happens, as
+ * "[Frame] Stall", with the audio buffer's fill before and after it: the
+ * output buffer is kept about half full by rate control (roughly 100 ms at
+ * the 200 ms the app asks for), so a stall longer than that is an audible
+ * gap, and the CoreAudio driver's underrun counter says whether it was one.
+ * The time an iteration spends blocked waiting for room in the audio buffer
+ * is pacing, not work, and is reported separately. */
+#define MANIC_STALL_USEC       60000
+#define MANIC_STALL_LINES_MAX  12   /* per 10 s window; the rest are only counted */
+
 typedef struct
 {
    retro_time_t window_start;   /* 0 = no open window */
    retro_time_t last_end;
    retro_time_t iter_sum;
-   retro_time_t iter_max;
+   retro_time_t iter_max;       /* gross: core, display and the wait for audio room */
+   retro_time_t busy_max;       /* the same iteration time net of that wait */
    retro_time_t gap_max;
+   retro_time_t blocked_sum;
    unsigned     iterations;
    unsigned     over_20ms;
+   unsigned     stalls;
+   unsigned     stall_lines;
+   int          fill_min;       /* lowest audio buffer fill seen after an iteration, % */
+   coreaudio3_diag_t audio_at_window_start;
 } manic_frame_stats_t;
 
 static manic_frame_stats_t frame_stats;
+static retro_time_t        frame_session_start;      /* first logged iteration of this game */
+static uint64_t            frame_session_iterations;
+static coreaudio3_diag_t   frame_audio_last;         /* for per-iteration deltas */
 
-static void manic_frame_stats_account(retro_time_t start, retro_time_t end)
+/* How full the audio output buffer is, 0..100, or -1 when unknown. */
+static int manic_audio_fill_pct(void)
 {
-   retro_time_t dt = end - start;
+   audio_driver_state_t *st = audio_state_get_ptr();
+   size_t avail;
+   if (!st || !st->current_audio || !st->current_audio->write_avail
+         || !st->context_audio_data || !st->buffer_size)
+      return -1;
+   avail = st->current_audio->write_avail(st->context_audio_data);
+   if (avail > st->buffer_size)
+      avail = st->buffer_size;
+   return (int)(100 - (avail * 100) / st->buffer_size);
+}
+
+/* Called when a game starts, so "+T" in the stall lines counts from its boot. */
+void manic_frame_stats_reset(void)
+{
+   memset(&frame_stats, 0, sizeof(frame_stats));
+   frame_session_start      = 0;
+   frame_session_iterations = 0;
+   coreaudio3_diag_read(&frame_audio_last);
+}
+
+static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
+      int fill_before)
+{
+   retro_time_t dt       = end - start;
+   retro_time_t gap      = 0;
+   retro_time_t blocked;
+   int          fill_after;
+   coreaudio3_diag_t audio;
+
+   coreaudio3_diag_read(&audio);
+   fill_after = manic_audio_fill_pct();
+   blocked    = (retro_time_t)(audio.blocked_usec - frame_audio_last.blocked_usec);
+   if (blocked > dt)
+      blocked = dt;
+
+   if (!frame_session_start)
+   {
+      frame_session_start = start;
+      RARCH_LOG("[Frame] Timing on: stats every 10 s; an iteration or main-thread gap of %u ms or more is logged as it happens.\n",
+            (unsigned)(MANIC_STALL_USEC / 1000));
+   }
+   frame_session_iterations++;
 
    if (!frame_stats.window_start)
    {
+      /* the previous window's last end still bounds this iteration's gap */
+      retro_time_t last_end = frame_stats.last_end;
       memset(&frame_stats, 0, sizeof(frame_stats));
-      frame_stats.window_start = start;
+      frame_stats.window_start          = start;
+      frame_stats.last_end              = last_end;
+      frame_stats.fill_min              = 101;
+      frame_stats.audio_at_window_start = frame_audio_last;
    }
-   else
+   if (frame_stats.last_end)
    {
-      retro_time_t gap = start - frame_stats.last_end;
+      gap = start - frame_stats.last_end;
       if (gap > frame_stats.gap_max)
          frame_stats.gap_max = gap;
    }
    frame_stats.last_end = end;
    frame_stats.iterations++;
-   frame_stats.iter_sum += dt;
+   frame_stats.iter_sum    += dt;
+   frame_stats.blocked_sum += blocked;
    if (dt > frame_stats.iter_max)
       frame_stats.iter_max = dt;
+   if (dt - blocked > frame_stats.busy_max)
+      frame_stats.busy_max = dt - blocked;
    if (dt > 20000)
       frame_stats.over_20ms++;
+   if (fill_after >= 0 && fill_after < frame_stats.fill_min)
+      frame_stats.fill_min = fill_after;
+
+   if (dt >= MANIC_STALL_USEC || gap >= MANIC_STALL_USEC)
+   {
+      frame_stats.stalls++;
+      if (frame_stats.stall_lines < MANIC_STALL_LINES_MAX)
+      {
+         retro_time_t at = start - frame_session_start;
+         frame_stats.stall_lines++;
+         RARCH_LOG("[Frame] Stall at +%u.%03u s: iteration %llu took %u ms (%u ms of it waiting for audio room), %u ms idle before it; audio buffer %d%% -> %d%% full, %llu underruns so far.\n",
+               (unsigned)(at / 1000000), (unsigned)((at / 1000) % 1000),
+               (unsigned long long)frame_session_iterations,
+               (unsigned)(dt / 1000), (unsigned)(blocked / 1000), (unsigned)(gap / 1000),
+               fill_before, fill_after, (unsigned long long)audio.underruns);
+      }
+   }
+   frame_audio_last = audio;
 
    if (end - frame_stats.window_start >= 10 * 1000000)
    {
-      retro_time_t window = end - frame_stats.window_start;
-      unsigned     rate10 = (unsigned)(frame_stats.iterations * 10000000ULL / (window ? window : 1));
-      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Main thread elsewhere: longest gap %u ms.\n",
+      settings_t  *settings = config_get_ptr();
+      unsigned     rate     = settings ? settings->uints.audio_output_sample_rate : 0;
+      retro_time_t window   = end - frame_stats.window_start;
+      unsigned     iters    = frame_stats.iterations ? frame_stats.iterations : 1;
+      unsigned     rate10   = (unsigned)(frame_stats.iterations * 10000000ULL / (window ? window : 1));
+      unsigned long long underruns = audio.underruns - frame_stats.audio_at_window_start.underruns;
+      unsigned long long silent    = audio.silent_frames - frame_stats.audio_at_window_start.silent_frames;
+      if (!rate)
+         rate = 48000;
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
             frame_stats.iterations,
             (unsigned)(window / 1000),
             rate10 / 10, rate10 % 10,
-            (unsigned)(frame_stats.iter_sum / (frame_stats.iterations ? frame_stats.iterations : 1)),
+            (unsigned)(frame_stats.iter_sum / iters),
             (unsigned)(frame_stats.iter_max / 1000),
             frame_stats.over_20ms,
-            (unsigned)(frame_stats.gap_max / 1000));
+            (unsigned)(frame_stats.gap_max / 1000),
+            (unsigned)((frame_stats.iter_sum - frame_stats.blocked_sum) / iters),
+            (unsigned)(frame_stats.busy_max / 1000),
+            (unsigned)(frame_stats.blocked_sum / 1000),
+            (unsigned)(MANIC_STALL_USEC / 1000),
+            frame_stats.stalls,
+            underruns,
+            (unsigned)(silent * 1000 / rate),
+            frame_stats.fill_min <= 100 ? frame_stats.fill_min : -1);
       frame_stats.window_start = 0;
    }
 }
@@ -228,11 +331,12 @@ static void rarch_draw_observer(CFRunLoopObserverRef observer,
    uint32_t runloop_flags;
    settings_t  *settings  = config_get_ptr();
    bool        log_frames = settings && settings->bools.frame_time_log;
+   int          fill      = log_frames ? manic_audio_fill_pct() : -1;
    retro_time_t start     = log_frames ? cpu_features_get_time_usec() : 0;
    int          ret       = runloop_iterate();
 
    if (log_frames)
-      manic_frame_stats_account(start, cpu_features_get_time_usec());
+      manic_frame_stats_account(start, cpu_features_get_time_usec(), fill);
 
    if (ret == -1)
    {
@@ -1102,6 +1206,7 @@ static BOOL ManicPaused = false;
     }
     
     rarch_main(argc, argv, NULL);
+    manic_frame_stats_reset();
     
     rarch_start_draw_observer();
 }

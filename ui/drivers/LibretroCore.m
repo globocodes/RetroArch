@@ -984,6 +984,10 @@ static BOOL g_enableMonitorLibretroLog = NO;
     RARCH_LOG("[Input] %s\n", line.UTF8String ?: "");
 }
 
+- (void)logDiagnosticsEvent:(NSString *)tag line:(NSString *)line {
+    RARCH_LOG("[%s] %s\n", tag.UTF8String ?: "App", line.UTF8String ?: "");
+}
+
 static NSString *g_mameMissingFileLog = nil;
 static void libretroLogCallback(enum retro_log_level level, const char *fmt, va_list args) {
     char buffer[4096];

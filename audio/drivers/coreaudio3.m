@@ -22,8 +22,24 @@
 #include <stdlib.h>
 #include <memory.h>
 
+#include <features/features_cpu.h>
+
 #include "../audio_driver.h"
 #include "../../verbosity.h"
+#include "coreaudio3_diag.h"
+
+/* Manic MP: see coreaudio3_diag.h. Written from the render thread (underruns)
+ * and the emulator thread (blocked time), read from the emulator thread. */
+static _Atomic uint64_t g_diag_underruns;
+static _Atomic uint64_t g_diag_silent_frames;
+static _Atomic uint64_t g_diag_blocked_usec;
+
+void coreaudio3_diag_read(coreaudio3_diag_t *out)
+{
+   out->underruns     = atomic_load_explicit(&g_diag_underruns,     memory_order_relaxed);
+   out->silent_frames = atomic_load_explicit(&g_diag_silent_frames, memory_order_relaxed);
+   out->blocked_usec  = atomic_load_explicit(&g_diag_blocked_usec,  memory_order_relaxed);
+}
 
 #pragma mark - ringbuffer
 
@@ -149,6 +165,9 @@ static void rb_read_data(ringbuffer_h r,
          fill = (need/2)*sizeof(float);
          memset_pattern4(&d0[i], &quiet, fill);
          memset_pattern4(&d1[i], &quiet, fill);
+         /* Manic MP: an audible gap of need/2 frames; counted for the session log */
+         atomic_fetch_add_explicit(&g_diag_underruns, 1, memory_order_relaxed);
+         atomic_fetch_add_explicit(&g_diag_silent_frames, (uint64_t)(need/2), memory_order_relaxed);
       }
    } while (0);
 }
@@ -276,7 +295,14 @@ static bool g_interrupted;
          break;
 
       if (write_avail == 0)
+      {
+         /* Manic MP: time the emulator thread spends here is audio pacing,
+          * not core work; the frame logger subtracts it from the frame time. */
+         retro_time_t waited = cpu_features_get_time_usec();
          dispatch_semaphore_wait(_sema, DISPATCH_TIME_FOREVER);
+         waited = cpu_features_get_time_usec() - waited;
+         atomic_fetch_add_explicit(&g_diag_blocked_usec, (uint64_t)waited, memory_order_relaxed);
+      }
    }
 
    return written;
