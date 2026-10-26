@@ -178,7 +178,7 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
  * gap, and the CoreAudio driver's underrun counter says whether it was one.
  * The time an iteration spends blocked waiting for room in the audio buffer
  * is pacing, not work, and is reported separately. */
-#define MANIC_STALL_USEC       60000
+#define MANIC_STALL_USEC       30000   /* two or more missed 60 Hz slots */
 #define MANIC_STALL_LINES_MAX  12   /* per 10 s window; the rest are only counted */
 
 typedef struct
