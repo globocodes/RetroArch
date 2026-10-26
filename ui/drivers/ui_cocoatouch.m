@@ -33,7 +33,7 @@
 #include "cocoa/apple_platform.h"
 #include "../ui_companion_driver.h"
 #include "../../audio/audio_driver.h"
-#include "../../audio/drivers/coreaudio3_diag.h"
+#include "../../audio/drivers/coreaudio_diag.h"
 #include "../../configuration.h"
 #include "../../frontend/frontend.h"
 #include "../../input/drivers/cocoa_input.h"
@@ -195,13 +195,13 @@ typedef struct
    unsigned     stalls;
    unsigned     stall_lines;
    int          fill_min;       /* lowest audio buffer fill seen after an iteration, % */
-   coreaudio3_diag_t audio_at_window_start;
+   coreaudio_diag_t audio_at_window_start;
 } manic_frame_stats_t;
 
 static manic_frame_stats_t frame_stats;
 static retro_time_t        frame_session_start;      /* first logged iteration of this game */
 static uint64_t            frame_session_iterations;
-static coreaudio3_diag_t   frame_audio_last;         /* for per-iteration deltas */
+static coreaudio_diag_t   frame_audio_last;         /* for per-iteration deltas */
 
 /* How full the audio output buffer is, 0..100, or -1 when unknown. */
 static int manic_audio_fill_pct(void)
@@ -223,7 +223,7 @@ void manic_frame_stats_reset(void)
    memset(&frame_stats, 0, sizeof(frame_stats));
    frame_session_start      = 0;
    frame_session_iterations = 0;
-   coreaudio3_diag_read(&frame_audio_last);
+   coreaudio_diag_read(&frame_audio_last);
 }
 
 static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
@@ -233,9 +233,9 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
    retro_time_t gap      = 0;
    retro_time_t blocked;
    int          fill_after;
-   coreaudio3_diag_t audio;
+   coreaudio_diag_t audio;
 
-   coreaudio3_diag_read(&audio);
+   coreaudio_diag_read(&audio);
    fill_after = manic_audio_fill_pct();
    blocked    = (retro_time_t)(audio.blocked_usec - frame_audio_last.blocked_usec);
    if (blocked > dt)

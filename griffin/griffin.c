@@ -954,6 +954,10 @@ AUDIO
 #include "../audio/drivers/openal.c"
 #endif
 
+#ifdef __APPLE__
+#include "../audio/drivers/coreaudio_diag.c"
+#endif
+
 #ifdef HAVE_COREAUDIO
 #include "../audio/drivers/coreaudio.c"
 #endif

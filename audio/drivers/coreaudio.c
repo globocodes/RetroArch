@@ -33,8 +33,11 @@
 
 #include <defines/cocoa_defines.h>
 
+#include <features/features_cpu.h>
+
 #include "../audio_driver.h"
 #include "../../verbosity.h"
+#include "coreaudio_diag.h"
 
 typedef struct coreaudio
 {
@@ -105,6 +108,11 @@ static OSStatus audio_write_cb(void *userdata,
 
       /* Seems to be needed. */
       memset(outbuf, 0, write_avail);
+
+      /* Manic MP: an audible gap; the stream is float stereo, so
+       * write_avail bytes is write_avail / 8 frames. Counted for the
+       * session log (coreaudio_diag.h). */
+      coreaudio_diag_underrun((uint64_t)(write_avail / (2 * sizeof(float))));
 
       slock_unlock(dev->lock);
 
@@ -339,17 +347,24 @@ static ssize_t coreaudio_write(void *data, const void *buf_, size_t len)
          break;
       }
 
-#if TARGET_OS_IOS
-      if (write_avail == 0 && !scond_wait_timeout(
-               dev->cond, dev->lock, 300000))
-      {
-         slock_unlock(dev->lock);
-         break;
-      }
-#else
       if (write_avail == 0)
+      {
+         /* Manic MP: time the emulator thread spends here is audio pacing,
+          * not core work; the frame logger subtracts it from the frame time. */
+         retro_time_t waited = cpu_features_get_time_usec();
+#if TARGET_OS_IOS
+         bool woke = scond_wait_timeout(dev->cond, dev->lock, 300000);
+#else
+         bool woke = true;
          scond_wait(dev->cond, dev->lock);
 #endif
+         coreaudio_diag_blocked((uint64_t)(cpu_features_get_time_usec() - waited));
+         if (!woke)
+         {
+            slock_unlock(dev->lock);
+            break;
+         }
+      }
       slock_unlock(dev->lock);
    }
 
