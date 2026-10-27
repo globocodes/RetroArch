@@ -115,6 +115,9 @@
 
 #include "runtime_file.h"
 #include "runloop.h"
+#ifdef __APPLE__
+#include "manic_frame_timing.h"
+#endif
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
@@ -7961,7 +7964,16 @@ void core_run(void)
    else if (late_polling)
       current_core->flags &= ~RETRO_CORE_FLAG_INPUT_POLLED;
 
+#ifdef __APPLE__
+   {
+      /* Manic MP: the core's own time, for the session log's frame logger */
+      retro_time_t core_start = cpu_features_get_time_usec();
+      current_core->retro_run();
+      manic_frame_timing_core((uint64_t)(cpu_features_get_time_usec() - core_start));
+   }
+#else
    current_core->retro_run();
+#endif
 
 #ifdef HAVE_GAME_AI
    {

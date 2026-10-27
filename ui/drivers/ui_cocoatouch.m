@@ -34,6 +34,7 @@
 #include "../ui_companion_driver.h"
 #include "../../audio/audio_driver.h"
 #include "../../audio/drivers/coreaudio_diag.h"
+#include "../../manic_frame_timing.h"
 #include "../../configuration.h"
 #include "../../frontend/frontend.h"
 #include "../../input/drivers/cocoa_input.h"
@@ -177,7 +178,10 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
  * the 200 ms the app asks for), so a stall longer than that is an audible
  * gap, and the CoreAudio driver's underrun counter says whether it was one.
  * The time an iteration spends blocked waiting for room in the audio buffer
- * is pacing, not work, and is reported separately. */
+ * is pacing, not work, and is reported separately; so is the time inside the
+ * video driver's present (the vsync wait, manic_frame_timing.h), which is
+ * what turns a core overrun of 17 ms into a 35 or 52 ms iteration. "Core
+ * alone" is the iteration net of both. */
 #define MANIC_STALL_USEC       30000   /* two or more missed 60 Hz slots */
 #define MANIC_STALL_LINES_MAX  12   /* per 10 s window; the rest are only counted */
 
@@ -190,6 +194,10 @@ typedef struct
    retro_time_t busy_max;       /* the same iteration time net of that wait */
    retro_time_t gap_max;
    retro_time_t blocked_sum;
+   retro_time_t video_sum;      /* inside the video driver's present */
+   retro_time_t video_max;
+   retro_time_t core_sum;       /* net of the present and the audio wait */
+   retro_time_t core_max;
    unsigned     iterations;
    unsigned     over_20ms;
    unsigned     stalls;
@@ -202,6 +210,7 @@ static manic_frame_stats_t frame_stats;
 static retro_time_t        frame_session_start;      /* first logged iteration of this game */
 static uint64_t            frame_session_iterations;
 static coreaudio_diag_t   frame_audio_last;         /* for per-iteration deltas */
+static manic_frame_timing_t frame_timing_last;
 
 /* How full the audio output buffer is, 0..100, or -1 when unknown. */
 static int manic_audio_fill_pct(void)
@@ -224,6 +233,7 @@ void manic_frame_stats_reset(void)
    frame_session_start      = 0;
    frame_session_iterations = 0;
    coreaudio_diag_read(&frame_audio_last);
+   manic_frame_timing_read(&frame_timing_last);
 }
 
 static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
@@ -232,14 +242,27 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
    retro_time_t dt       = end - start;
    retro_time_t gap      = 0;
    retro_time_t blocked;
+   retro_time_t video;          /* this iteration's time inside the present */
+   retro_time_t core;           /* this iteration's core time net of present and audio wait */
    int          fill_after;
    coreaudio_diag_t audio;
+   manic_frame_timing_t timing;
 
    coreaudio_diag_read(&audio);
+   manic_frame_timing_read(&timing);
    fill_after = manic_audio_fill_pct();
    blocked    = (retro_time_t)(audio.blocked_usec - frame_audio_last.blocked_usec);
    if (blocked > dt)
       blocked = dt;
+   video      = (retro_time_t)(timing.video_usec - frame_timing_last.video_usec);
+   if (video > dt)
+      video = dt;
+   core       = (retro_time_t)(timing.core_usec - frame_timing_last.core_usec);
+   if (core > dt)
+      core = dt;
+   core      -= video + blocked;   /* both happen inside retro_run */
+   if (core < 0)
+      core = 0;
 
    if (!frame_session_start)
    {
@@ -273,6 +296,12 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       frame_stats.iter_max = dt;
    if (dt - blocked > frame_stats.busy_max)
       frame_stats.busy_max = dt - blocked;
+   frame_stats.video_sum += video;
+   if (video > frame_stats.video_max)
+      frame_stats.video_max = video;
+   frame_stats.core_sum += core;
+   if (core > frame_stats.core_max)
+      frame_stats.core_max = core;
    if (dt > 20000)
       frame_stats.over_20ms++;
    if (fill_after >= 0 && fill_after < frame_stats.fill_min)
@@ -285,14 +314,16 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       {
          retro_time_t at = start - frame_session_start;
          frame_stats.stall_lines++;
-         RARCH_LOG("[Frame] Stall at +%u.%03u s: iteration %llu took %u ms (%u ms of it waiting for audio room), %u ms idle before it; audio buffer %d%% -> %d%% full, %llu underruns so far.\n",
+         RARCH_LOG("[Frame] Stall at +%u.%03u s: iteration %llu took %u ms (core %u ms, display %u ms, %u ms waiting for audio room), %u ms idle before it; audio buffer %d%% -> %d%% full, %llu underruns so far.\n",
                (unsigned)(at / 1000000), (unsigned)((at / 1000) % 1000),
                (unsigned long long)frame_session_iterations,
-               (unsigned)(dt / 1000), (unsigned)(blocked / 1000), (unsigned)(gap / 1000),
+               (unsigned)(dt / 1000), (unsigned)(core / 1000), (unsigned)(video / 1000),
+               (unsigned)(blocked / 1000), (unsigned)(gap / 1000),
                fill_before, fill_after, (unsigned long long)audio.underruns);
       }
    }
-   frame_audio_last = audio;
+   frame_audio_last  = audio;
+   frame_timing_last = timing;
 
    if (end - frame_stats.window_start >= 10 * 1000000)
    {
@@ -305,13 +336,17 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       unsigned long long silent    = audio.silent_frames - frame_stats.audio_at_window_start.silent_frames;
       if (!rate)
          rate = 48000;
-      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
             frame_stats.iterations,
             (unsigned)(window / 1000),
             rate10 / 10, rate10 % 10,
             (unsigned)(frame_stats.iter_sum / iters),
             (unsigned)(frame_stats.iter_max / 1000),
             frame_stats.over_20ms,
+            (unsigned)(frame_stats.core_sum / iters),
+            (unsigned)(frame_stats.core_max / 1000),
+            (unsigned)(frame_stats.video_sum / iters),
+            (unsigned)(frame_stats.video_max / 1000),
             (unsigned)(frame_stats.gap_max / 1000),
             (unsigned)((frame_stats.iter_sum - frame_stats.blocked_sum) / iters),
             (unsigned)(frame_stats.busy_max / 1000),

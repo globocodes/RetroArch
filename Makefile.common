@@ -822,6 +822,7 @@ ifeq ($(HAVE_COREAUDIO), 1)
    DEFINES += -DHAVE_COREAUDIO
    OBJ += audio/drivers/coreaudio.o
    OBJ += audio/drivers/coreaudio_diag.o
+   OBJ += manic_frame_timing.o
    HAVE_COREAUDIO_LIBS = 1
 endif
 

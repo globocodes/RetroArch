@@ -64,6 +64,10 @@
 #include "../list_special.h"
 #include "../retroarch.h"
 #include "../verbosity.h"
+#ifdef __APPLE__
+#include <features/features_cpu.h>
+#include "../manic_frame_timing.h"
+#endif
 
 #define TIME_TO_FPS(last_time, new_time, frames) ((1000000.0f * (frames)) / ((new_time) - (last_time)))
 
@@ -4238,8 +4242,13 @@ void video_driver_frame(const void *data, unsigned width,
          && video_st->current_video
          && video_st->current_video->frame)
    {
+      bool frame_ok;
+#ifdef __APPLE__
+      /* Manic MP: the present (and its vsync wait), for the session log */
+      retro_time_t frame_start = cpu_features_get_time_usec();
+#endif
       video_info.current_subframe = 0;
-      if (video_st->current_video->frame(
+      frame_ok = video_st->current_video->frame(
                video_st->data, data, width, height,
                video_st->frame_count, (unsigned)pitch,
 #if HAVE_MENU
@@ -4250,7 +4259,11 @@ void video_driver_frame(const void *data, unsigned width,
 #endif
                ? ""
                : video_driver_msg,
-               &video_info))
+               &video_info);
+#ifdef __APPLE__
+      manic_frame_timing_video((uint64_t)(cpu_features_get_time_usec() - frame_start));
+#endif
+      if (frame_ok)
          video_st->flags |=  VIDEO_FLAG_ACTIVE;
       else
          video_st->flags &= ~VIDEO_FLAG_ACTIVE;

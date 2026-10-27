@@ -956,6 +956,7 @@ AUDIO
 
 #ifdef __APPLE__
 #include "../audio/drivers/coreaudio_diag.c"
+#include "../manic_frame_timing.c"
 #endif
 
 #ifdef HAVE_COREAUDIO
