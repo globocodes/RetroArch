@@ -26,6 +26,7 @@
 #include "../ui_companion_driver.h"
 #include "../../audio/audio_driver.h"
 #include "../../configuration.h"
+#include "../../manic_frame_timing.h"
 #include "../../frontend/frontend.h"
 #include "../../input/drivers/cocoa_input.h"
 #include "../../input/drivers_keyboard/keyboard_event_apple.h"
@@ -986,6 +987,10 @@ static BOOL g_enableMonitorLibretroLog = NO;
 
 - (void)logDiagnosticsEvent:(NSString *)tag line:(NSString *)line {
     RARCH_LOG("[%s] %s\n", tag.UTF8String ?: "App", line.UTF8String ?: "");
+}
+
+- (void)setDiagnosticsScreen:(NSString *)screen {
+    manic_frame_set_present_screen(screen.UTF8String);
 }
 
 static NSString *g_mameMissingFileLog = nil;

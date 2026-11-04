@@ -207,6 +207,7 @@ typedef struct
 } manic_frame_stats_t;
 
 static manic_frame_stats_t frame_stats;
+static char                frame_present_screen[96] = "device"; /* manic_frame_set_present_screen */
 static retro_time_t        frame_session_start;      /* first logged iteration of this game */
 static uint64_t            frame_session_iterations;
 static coreaudio_diag_t   frame_audio_last;         /* for per-iteration deltas */
@@ -224,6 +225,14 @@ static int manic_audio_fill_pct(void)
    if (avail > st->buffer_size)
       avail = st->buffer_size;
    return (int)(100 - (avail * 100) / st->buffer_size);
+}
+
+/* The app names the screen the game view presents on (main thread). Kept
+ * across manic_frame_stats_reset: the view can move before the core boots. */
+void manic_frame_set_present_screen(const char *name)
+{
+   strlcpy(frame_present_screen, (name && *name) ? name : "device",
+         sizeof(frame_present_screen));
 }
 
 /* Called when a game starts, so "+T" in the stall lines counts from its boot. */
@@ -336,7 +345,7 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       unsigned long long silent    = audio.silent_frames - frame_stats.audio_at_window_start.silent_frames;
       if (!rate)
          rate = 48000;
-      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms, presenting on %s. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
             frame_stats.iterations,
             (unsigned)(window / 1000),
             rate10 / 10, rate10 % 10,
@@ -347,6 +356,7 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
             (unsigned)(frame_stats.core_max / 1000),
             (unsigned)(frame_stats.video_sum / iters),
             (unsigned)(frame_stats.video_max / 1000),
+            frame_present_screen,
             (unsigned)(frame_stats.gap_max / 1000),
             (unsigned)((frame_stats.iter_sum - frame_stats.blocked_sum) / iters),
             (unsigned)(frame_stats.busy_max / 1000),

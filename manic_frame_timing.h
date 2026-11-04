@@ -39,6 +39,15 @@ void manic_frame_timing_core(uint64_t usec);
 /* Called by video_driver_frame() around the driver's frame(). */
 void manic_frame_timing_video(uint64_t usec);
 
+/* Which screen the game's CAMetalLayer presents on, as the app names it
+ * ("device", or "AirPlay 1920x1080 @ 60 Hz"): the present time above is the
+ * swapchain wait on whichever screen the layer sits on, so the frame logger
+ * (ui/drivers/ui_cocoatouch.m) tags every "[Frame] Stats" window with this.
+ * Set from the main thread by -[LibretroCore setDiagnosticsScreen:] when the
+ * app moves the view; read on the main thread by the logger. Defaults to
+ * "device". */
+void manic_frame_set_present_screen(const char *name);
+
 RETRO_END_DECLS
 
 #endif

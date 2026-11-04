@@ -180,6 +180,11 @@ typedef NS_ENUM(NSInteger, LibretroNetplayEvent) {
 /// Manic MP: the same, as "[<tag>] <line>", for the app's own events in the
 /// session log (device state, auto save states, shader cache growth).
 - (void)logDiagnosticsEvent:(NSString *_Nonnull)tag line:(NSString *_Nonnull)line;
+/// Manic MP: name the screen the game view presents on ("device", or
+/// "AirPlay 1920x1080 @ 60 Hz") so every "[Frame] Stats" window says where
+/// its present time was measured. Main thread; the app calls it each time it
+/// moves the view to or from the AirPlay window.
+- (void)setDiagnosticsScreen:(NSString *_Nonnull)screen;
 - (void)loadAmiibo:(NSString *_Nonnull)path;
 - (BOOL)isSearchingAmiibo;
 - (void)registerAzaharKeyboard:(void(^ _Nullable)(AzaharKeyboardConfig *_Nonnull config))callback;
