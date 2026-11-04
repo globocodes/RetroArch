@@ -183,7 +183,18 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
  * what turns a core overrun of 17 ms into a 35 or 52 ms iteration. "Core
  * alone" is the iteration net of both. */
 #define MANIC_STALL_USEC       30000   /* two or more missed 60 Hz slots */
+#define MANIC_STALL_USEC_EXT   20000   /* while presenting on an external (AirPlay) screen: one missed slot */
 #define MANIC_STALL_LINES_MAX  12   /* per 10 s window; the rest are only counted */
+
+/* Pacing (added for the walk-stop hitch of 2026-11): a hitch that holds one
+ * frame for an extra slot is a 20-33 ms iteration, under the stall threshold
+ * and invisible in a 10 s average, so each window also reports a histogram
+ * of iteration times, the iterations that produced no new frame (the screen
+ * repeated the last one), the iterations held two or more display slots with
+ * their mean spacing (a ~500 ms period shows up there), and the audio buffer
+ * fill at the start of the over-20 ms iterations (a full buffer at every
+ * hitch means audio pacing, not vsync, is holding the core). */
+#define MANIC_HIST_BUCKETS     5    /* <17, 17-20, 20-25, 25-33, >33 ms */
 
 typedef struct
 {
@@ -204,6 +215,14 @@ typedef struct
    unsigned     stall_lines;
    int          fill_min;       /* lowest audio buffer fill seen after an iteration, % */
    coreaudio_diag_t audio_at_window_start;
+   unsigned     hist[MANIC_HIST_BUCKETS];
+   unsigned     no_new_frame;   /* iterations in which the core presented nothing */
+   unsigned     held2;          /* iterations over 1.5 display slots */
+   retro_time_t held2_last;     /* start of the previous such iteration, 0 = none yet */
+   retro_time_t held2_gap_sum;  /* spacing between consecutive ones */
+   unsigned     held2_gaps;
+   long         over20_fill_sum;/* audio fill at the start of over-20 ms iterations */
+   unsigned     over20_fill_n;
 } manic_frame_stats_t;
 
 static manic_frame_stats_t frame_stats;
@@ -257,9 +276,20 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
    coreaudio_diag_t audio;
    manic_frame_timing_t timing;
 
+   bool         external   = strcmp(frame_present_screen, "device") != 0;
+   retro_time_t stall_usec = external ? MANIC_STALL_USEC_EXT : MANIC_STALL_USEC;
+   settings_t  *cfg        = config_get_ptr();
+   float        refresh    = (cfg && cfg->floats.video_refresh_rate > 1.0f)
+                           ? cfg->floats.video_refresh_rate : 60.0f;
+   retro_time_t slot       = (retro_time_t)(1000000.0f / refresh);
+   uint64_t     new_frames;
+
    coreaudio_diag_read(&audio);
    manic_frame_timing_read(&timing);
    fill_after = manic_audio_fill_pct();
+   /* presents of a new picture this iteration: frame() calls net of dupes */
+   new_frames = (timing.video_frames - frame_timing_last.video_frames)
+              - (timing.video_dupes  - frame_timing_last.video_dupes);
    blocked    = (retro_time_t)(audio.blocked_usec - frame_audio_last.blocked_usec);
    if (blocked > dt)
       blocked = dt;
@@ -276,8 +306,8 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
    if (!frame_session_start)
    {
       frame_session_start = start;
-      RARCH_LOG("[Frame] Timing on: stats every 10 s; an iteration or main-thread gap of %u ms or more is logged as it happens.\n",
-            (unsigned)(MANIC_STALL_USEC / 1000));
+      RARCH_LOG("[Frame] Timing on: stats every 10 s; an iteration or main-thread gap of %u ms or more is logged as it happens (%u ms while presenting on an external screen).\n",
+            (unsigned)(MANIC_STALL_USEC / 1000), (unsigned)(MANIC_STALL_USEC_EXT / 1000));
    }
    frame_session_iterations++;
 
@@ -312,11 +342,33 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
    if (core > frame_stats.core_max)
       frame_stats.core_max = core;
    if (dt > 20000)
+   {
       frame_stats.over_20ms++;
+      if (fill_before >= 0)
+      {
+         frame_stats.over20_fill_sum += fill_before;
+         frame_stats.over20_fill_n++;
+      }
+   }
    if (fill_after >= 0 && fill_after < frame_stats.fill_min)
       frame_stats.fill_min = fill_after;
 
-   if (dt >= MANIC_STALL_USEC || gap >= MANIC_STALL_USEC)
+   /* pacing */
+   frame_stats.hist[dt < 17000 ? 0 : dt < 20000 ? 1 : dt < 25000 ? 2 : dt < 33000 ? 3 : 4]++;
+   if (!new_frames)
+      frame_stats.no_new_frame++;
+   if (dt > slot + slot / 2)
+   {
+      frame_stats.held2++;
+      if (frame_stats.held2_last)
+      {
+         frame_stats.held2_gap_sum += start - frame_stats.held2_last;
+         frame_stats.held2_gaps++;
+      }
+      frame_stats.held2_last = start;
+   }
+
+   if (dt >= stall_usec || gap >= stall_usec)
    {
       frame_stats.stalls++;
       if (frame_stats.stall_lines < MANIC_STALL_LINES_MAX)
@@ -345,7 +397,7 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       unsigned long long silent    = audio.silent_frames - frame_stats.audio_at_window_start.silent_frames;
       if (!rate)
          rate = 48000;
-      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms, presenting on %s. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full.\n",
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms, presenting on %s. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full. Pacing: iterations under 17 ms %u, 17-20 %u, 20-25 %u, 25-33 %u, over 33 %u; no new frame %u; held 2+ slots %u, mean spacing %u ms; audio buffer at the start of the over-20 ms iterations avg %d%%.\n",
             frame_stats.iterations,
             (unsigned)(window / 1000),
             rate10 / 10, rate10 % 10,
@@ -361,11 +413,19 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
             (unsigned)((frame_stats.iter_sum - frame_stats.blocked_sum) / iters),
             (unsigned)(frame_stats.busy_max / 1000),
             (unsigned)(frame_stats.blocked_sum / 1000),
-            (unsigned)(MANIC_STALL_USEC / 1000),
+            (unsigned)(stall_usec / 1000),
             frame_stats.stalls,
             underruns,
             (unsigned)(silent * 1000 / rate),
-            frame_stats.fill_min <= 100 ? frame_stats.fill_min : -1);
+            frame_stats.fill_min <= 100 ? frame_stats.fill_min : -1,
+            frame_stats.hist[0], frame_stats.hist[1], frame_stats.hist[2],
+            frame_stats.hist[3], frame_stats.hist[4],
+            frame_stats.no_new_frame,
+            frame_stats.held2,
+            frame_stats.held2_gaps
+               ? (unsigned)(frame_stats.held2_gap_sum / frame_stats.held2_gaps / 1000) : 0,
+            frame_stats.over20_fill_n
+               ? (int)(frame_stats.over20_fill_sum / frame_stats.over20_fill_n) : -1);
       frame_stats.window_start = 0;
    }
 }
