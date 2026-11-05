@@ -4262,6 +4262,8 @@ void video_driver_frame(const void *data, unsigned width,
                &video_info);
 #ifdef __APPLE__
       manic_frame_timing_video((uint64_t)(cpu_features_get_time_usec() - frame_start));
+      if (!data)
+         manic_frame_timing_video_dupe();
 #endif
       if (frame_ok)
          video_st->flags |=  VIDEO_FLAG_ACTIVE;

@@ -29,6 +29,8 @@ typedef struct manic_frame_timing
    uint64_t video_usec;
    /* how many times frame() was called */
    uint64_t video_frames;
+   /* of those, calls with no new picture (the core duped the last frame) */
+   uint64_t video_dupes;
 } manic_frame_timing_t;
 
 void manic_frame_timing_read(manic_frame_timing_t *out);
@@ -38,6 +40,9 @@ void manic_frame_timing_core(uint64_t usec);
 
 /* Called by video_driver_frame() around the driver's frame(). */
 void manic_frame_timing_video(uint64_t usec);
+
+/* Called by video_driver_frame() when the core passed no picture (NULL data). */
+void manic_frame_timing_video_dupe(void);
 
 /* Which screen the game's CAMetalLayer presents on, as the app names it
  * ("device", or "AirPlay 1920x1080 @ 60 Hz"): the present time above is the

@@ -8,12 +8,14 @@
 static _Atomic uint64_t g_core_usec;
 static _Atomic uint64_t g_video_usec;
 static _Atomic uint64_t g_video_frames;
+static _Atomic uint64_t g_video_dupes;
 
 void manic_frame_timing_read(manic_frame_timing_t *out)
 {
    out->core_usec    = atomic_load_explicit(&g_core_usec,    memory_order_relaxed);
    out->video_usec   = atomic_load_explicit(&g_video_usec,   memory_order_relaxed);
    out->video_frames = atomic_load_explicit(&g_video_frames, memory_order_relaxed);
+   out->video_dupes  = atomic_load_explicit(&g_video_dupes,  memory_order_relaxed);
 }
 
 void manic_frame_timing_core(uint64_t usec)
@@ -25,4 +27,9 @@ void manic_frame_timing_video(uint64_t usec)
 {
    atomic_fetch_add_explicit(&g_video_usec, usec, memory_order_relaxed);
    atomic_fetch_add_explicit(&g_video_frames, 1, memory_order_relaxed);
+}
+
+void manic_frame_timing_video_dupe(void)
+{
+   atomic_fetch_add_explicit(&g_video_dupes, 1, memory_order_relaxed);
 }
