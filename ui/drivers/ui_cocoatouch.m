@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <boolean.h>
 
@@ -227,6 +228,9 @@ typedef struct
 
 static manic_frame_stats_t frame_stats;
 static char                frame_present_screen[96] = "device"; /* manic_frame_set_present_screen */
+static unsigned            frame_swapchain_width;    /* manic_frame_swapchain_changed */
+static unsigned            frame_swapchain_height;
+static bool                frame_swapchain_external; /* the screen it was last created for */
 static retro_time_t        frame_session_start;      /* first logged iteration of this game */
 static uint64_t            frame_session_iterations;
 static coreaudio_diag_t   frame_audio_last;         /* for per-iteration deltas */
@@ -254,10 +258,51 @@ void manic_frame_set_present_screen(const char *name)
          sizeof(frame_present_screen));
 }
 
+/* The Vulkan context (gfx/drivers_context/cocoa_vk_ctx.m) created a
+ * swapchain. The size goes into every "[Frame] Stats" line; a change of size
+ * is logged as it happens, under "[AirPlay]" when the external screen is on
+ * either side of it, so the log shows the swapchain following the game view
+ * to that screen and back. Kept across manic_frame_stats_reset like the
+ * screen name. */
+void manic_frame_swapchain_changed(unsigned width, unsigned height)
+{
+   settings_t *settings = config_get_ptr();
+   bool        external = strcmp(frame_present_screen, "device") != 0;
+
+   if (     frame_swapchain_width && frame_swapchain_height
+         && (width != frame_swapchain_width || height != frame_swapchain_height)
+         && settings && settings->bools.frame_time_log)
+   {
+      retro_time_t at = frame_session_start
+         ? cpu_features_get_time_usec() - frame_session_start : 0;
+      if (external || frame_swapchain_external)
+      {
+         char      wall[16];
+         time_t    now = time(NULL);
+         struct tm tm_now;
+         localtime_r(&now, &tm_now);
+         strftime(wall, sizeof(wall), "%H:%M:%S", &tm_now);
+         RARCH_LOG("[AirPlay] %s +%u.%03u s: swapchain recreated for %s: %ux%u -> %ux%u px.\n",
+               wall, (unsigned)(at / 1000000), (unsigned)((at / 1000) % 1000),
+               frame_present_screen,
+               frame_swapchain_width, frame_swapchain_height, width, height);
+      }
+      else
+         RARCH_LOG("[Frame] Swapchain at +%u.%03u s: recreated for %s: %ux%u -> %ux%u px.\n",
+               (unsigned)(at / 1000000), (unsigned)((at / 1000) % 1000),
+               frame_present_screen,
+               frame_swapchain_width, frame_swapchain_height, width, height);
+   }
+   frame_swapchain_width    = width;
+   frame_swapchain_height   = height;
+   frame_swapchain_external = external;
+}
+
 /* Called when a game starts, so "+T" in the stall lines counts from its boot. */
 void manic_frame_stats_reset(void)
 {
    memset(&frame_stats, 0, sizeof(frame_stats));
+   manic_frame_present_take(NULL);
    frame_session_start      = 0;
    frame_session_iterations = 0;
    coreaudio_diag_read(&frame_audio_last);
@@ -395,9 +440,11 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
       unsigned     rate10   = (unsigned)(frame_stats.iterations * 10000000ULL / (window ? window : 1));
       unsigned long long underruns = audio.underruns - frame_stats.audio_at_window_start.underruns;
       unsigned long long silent    = audio.silent_frames - frame_stats.audio_at_window_start.silent_frames;
+      manic_frame_present_t shown;
+      manic_frame_present_take(&shown);
       if (!rate)
          rate = 48000;
-      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms, presenting on %s. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full. Pacing: iterations under 17 ms %u, 17-20 %u, 20-25 %u, 25-33 %u, over 33 %u; no new frame %u; held 2+ slots %u, mean spacing %u ms; audio buffer at the start of the over-20 ms iterations avg %d%%.\n",
+      RARCH_LOG("[Frame] Stats: %u iterations in %u ms (%u.%u/s). Core and display: avg %u us, max %u ms, %u over 20 ms. Core alone: avg %u us, max %u ms. Display (present, vsync): avg %u us, max %u ms, presenting on %s. Main thread elsewhere: longest gap %u ms. Net of audio wait: avg %u us, max %u ms, waited %u ms in all. Stalls >= %u ms: %u. Audio: %llu underruns (%u ms of silence), buffer never below %d%% full. Pacing: iterations under 17 ms %u, 17-20 %u, 20-25 %u, 25-33 %u, over 33 %u; no new frame %u; held 2+ slots %u, mean spacing %u ms; audio buffer at the start of the over-20 ms iterations avg %d%%. Screen: swapchain %ux%u px; %u frames shown, interval avg %u us, max %u ms; shown for 2+ refreshes %u, mean spacing %u ms; replaced within half a refresh %u; never shown %u.\n",
             frame_stats.iterations,
             (unsigned)(window / 1000),
             rate10 / 10, rate10 % 10,
@@ -425,7 +472,17 @@ static void manic_frame_stats_account(retro_time_t start, retro_time_t end,
             frame_stats.held2_gaps
                ? (unsigned)(frame_stats.held2_gap_sum / frame_stats.held2_gaps / 1000) : 0,
             frame_stats.over20_fill_n
-               ? (int)(frame_stats.over20_fill_sum / frame_stats.over20_fill_n) : -1);
+               ? (int)(frame_stats.over20_fill_sum / frame_stats.over20_fill_n) : -1,
+            frame_swapchain_width, frame_swapchain_height,
+            (unsigned)shown.shown,
+            shown.intervals
+               ? (unsigned)(shown.interval_sum_usec / shown.intervals) : 0,
+            (unsigned)(shown.interval_max_usec / 1000),
+            (unsigned)shown.held,
+            shown.held_gaps
+               ? (unsigned)(shown.held_gap_sum_usec / shown.held_gaps / 1000) : 0,
+            (unsigned)shown.quick,
+            (unsigned)shown.never_shown);
       frame_stats.window_start = 0;
    }
 }
@@ -789,10 +846,33 @@ enum
 @end
 
 #ifdef HAVE_COCOA_METAL
+/* Manic MP: the layer MoltenVK takes its drawables from. With the Diagnostics
+ * Log on, every drawable reports back when the screen showed it, which is
+ * the only view the frame logger has past the present call: a frame the
+ * screen held for two refreshes, replaced early or never showed
+ * (manic_frame_timing.h). The handler runs on a thread of the system's
+ * choosing, after the frame is on the screen. */
+@interface ManicMetalLayer : CAMetalLayer
+@end
+
+@implementation ManicMetalLayer
+
+- (id<CAMetalDrawable>)nextDrawable {
+    id<CAMetalDrawable> drawable = [super nextDrawable];
+    settings_t *settings = config_get_ptr();
+    if (drawable && settings && settings->bools.frame_time_log)
+        [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+            manic_frame_presented(shown.presentedTime);
+        }];
+    return drawable;
+}
+
+@end
+
 @implementation MetalLayerView
 
 + (Class)layerClass {
-    return [CAMetalLayer class];
+    return [ManicMetalLayer class];
 }
 
 - (instancetype)init {

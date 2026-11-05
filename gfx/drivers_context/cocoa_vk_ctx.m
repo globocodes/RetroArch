@@ -27,6 +27,8 @@
 #include <AppKit/NSScreen.h>
 #endif
 
+#include <math.h>
+
 #include <retro_timers.h>
 #include <compat/apple_compat.h>
 #include <string/stdstring.h>
@@ -38,6 +40,7 @@
 #include "../../retroarch.h"
 #include "../../verbosity.h"
 #include "../common/vulkan_common.h"
+#include "../../manic_frame_timing.h"
 #ifdef HAVE_METAL
 #include "../common/metal_common.h"
 #endif
@@ -48,6 +51,10 @@ typedef struct cocoa_vk_ctx_data
    int swap_interval;
    unsigned width;
    unsigned height;
+   /* Manic MP: a new view size waits one check before it becomes a resize,
+    * see cocoa_vk_gfx_ctx_check_window. */
+   unsigned pending_width;
+   unsigned pending_height;
 } cocoa_vk_ctx_data_t;
 
 /* TODO/FIXME - static globals */
@@ -127,13 +134,80 @@ static void cocoa_vk_gfx_ctx_get_video_size(void *data,
    *height                         = CGRectGetHeight(size);
 }
 #else
+/* Manic MP: the screen the render view is on. The app moves the view into the
+ * window of an external (AirPlay) screen and back, so this is not always the
+ * main screen. NULL while the view is in no window. */
+static UIScreen *cocoa_vk_view_screen(void)
+{
+    UIView   *view   = apple_platform.renderView;
+    UIWindow *window = view.window;
+    if (!window)
+        return nil;
+    if (@available(iOS 13.0, tvOS 13.0, *))
+    {
+        UIScreen *screen = window.windowScene.screen;
+        if (screen)
+            return screen;
+    }
+    return [UIScreen mainScreen];
+}
+
+/* Manic MP: pixels of that screen per point of the render view. On the
+ * device this is the screen's native scale, as before. On the external
+ * screen the app lays the view out at the core's size (640x480 pt) inside a
+ * container it scales up to the window height, so the factor is the screen's
+ * scale times that transform (1 x 2.25): the swapchain then holds exactly
+ * the pixels the view covers there (1440x1080) and the compositor has
+ * nothing to stretch. Before, the main screen's scale was used on every
+ * screen, which gave a 1280x960 swapchain stretched by 1.125 on a 1080p
+ * AirPlay screen. */
+static CGFloat cocoa_vk_view_scale(void)
+{
+    UIView   *view   = apple_platform.renderView;
+    UIScreen *screen = cocoa_vk_view_screen();
+    CGRect    bounds = view.bounds;
+    CGFloat   scale;
+
+    if (!screen || bounds.size.width <= 0.0)
+        return cocoa_screen_get_native_scale();
+
+    /* The device screen keeps the scale it always had. */
+    if (screen == [UIScreen mainScreen])
+        return cocoa_screen_get_native_scale();
+
+    scale = screen.nativeScale;
+    if (scale <= 0.0)
+        scale = 1.0;
+    /* nil = the window: includes the transforms of the views above. */
+    scale *= [view convertRect:bounds toView:nil].size.width / bounds.size.width;
+    return scale;
+}
+
+/* Same arithmetic as MoltenVK's surface extent (bounds x contentsScale,
+ * truncated), so the size reported here is the size of the swapchain it
+ * creates once the layer carries this scale. */
 static void cocoa_vk_gfx_ctx_get_video_size(void *data,
       unsigned* width, unsigned* height)
 {
-    float screenscale               = cocoa_screen_get_native_scale();
+    CGFloat scale                   = cocoa_vk_view_scale();
     CGRect size                     = [apple_platform.renderView bounds];
-    *width                          = CGRectGetWidth(size)  * screenscale;
-    *height                         = CGRectGetHeight(size) * screenscale;
+    *width                          = (unsigned)trunc(CGRectGetWidth(size)  * scale);
+    *height                         = (unsigned)trunc(CGRectGetHeight(size) * scale);
+}
+
+/* Give the layer the scale the size above was computed with, before the
+ * swapchain is created from it, and tell the frame logger the refresh rate
+ * of the screen its drawables are shown on. */
+static void cocoa_vk_sync_layer(void)
+{
+    CAMetalLayer *layer  = ((MetalLayerView*)apple_platform.renderView).metalLayer;
+    UIScreen     *screen = cocoa_vk_view_screen();
+    CGFloat       scale  = cocoa_vk_view_scale();
+
+    if (layer && scale > 0.0 && fabs(layer.contentsScale - scale) > 0.001)
+        layer.contentsScale = scale;
+    if (screen)
+        manic_frame_present_set_refresh((float)screen.maximumFramesPerSecond);
 }
 #endif
 
@@ -146,7 +220,9 @@ static float cocoa_vk_gfx_ctx_get_refresh_rate(void *data)
     CFRelease(currentMode);
     return currentRate;
 #else
-    return [UIScreen mainScreen].maximumFramesPerSecond;
+    /* Manic MP: the screen the game view is on, not always the main one. */
+    UIScreen *screen = cocoa_vk_view_screen();
+    return (screen ? screen : [UIScreen mainScreen]).maximumFramesPerSecond;
 #endif
 }
 
@@ -174,10 +250,34 @@ static void cocoa_vk_gfx_ctx_check_window(void *data, bool *quit,
 
    if (new_width != *width || new_height != *height)
    {
+#if !defined(OSX)
+      /* Manic MP: when the app moves the view to another window the first
+       * check can land before the layout pass, with the old bounds under the
+       * new transform. A size has to be seen twice in a row before the
+       * swapchain is recreated for it. */
+      if (     new_width  != cocoa_ctx->pending_width
+            || new_height != cocoa_ctx->pending_height)
+      {
+         cocoa_ctx->pending_width  = new_width;
+         cocoa_ctx->pending_height = new_height;
+         return;
+      }
+      cocoa_vk_sync_layer();
+#endif
       *width  = new_width;
       *height = new_height;
       *resize = true;
    }
+#if !defined(OSX)
+   else
+   {
+      cocoa_ctx->pending_width  = 0;
+      cocoa_ctx->pending_height = 0;
+      /* Same size: keep the layer's scale and the logger's refresh rate
+       * right all the same (a move between two screens of one size). */
+      cocoa_vk_sync_layer();
+   }
+#endif
 }
 
 static void cocoa_vk_gfx_ctx_swap_interval(void *data, int i)
@@ -294,6 +394,10 @@ static bool cocoa_vk_gfx_ctx_set_video_mode(void *data,
    cocoa_ctx->width               = width;
    cocoa_ctx->height              = height;
 
+   /* Manic MP: the layer gets the scale the size was computed with before
+    * MoltenVK reads its extent. */
+   cocoa_vk_sync_layer();
+
    if (!vulkan_surface_create(&cocoa_ctx->vk,
                               VULKAN_WSI_MVK_IOS,
                               NULL,
@@ -305,6 +409,8 @@ static bool cocoa_vk_gfx_ctx_set_video_mode(void *data,
       RARCH_ERR("[iOS Vulkan]: Failed to create surface.\n");
       return false;
    }
+   manic_frame_swapchain_changed(cocoa_ctx->vk.context.swapchain_width,
+         cocoa_ctx->vk.context.swapchain_height);
 
    /* TODO: Maybe iOS users should be able to
     * show/hide the status bar here? */
@@ -349,6 +455,10 @@ static bool cocoa_vk_gfx_ctx_set_resize(void *data, unsigned width, unsigned hei
    if (cocoa_ctx->vk.flags & VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN)
       vulkan_acquire_next_image(&cocoa_ctx->vk);
    cocoa_ctx->vk.flags           &= ~VK_DATA_FLAG_NEED_NEW_SWAPCHAIN;
+#if !defined(OSX)
+   manic_frame_swapchain_changed(cocoa_ctx->vk.context.swapchain_width,
+         cocoa_ctx->vk.context.swapchain_height);
+#endif
    return true;
 }
 #endif
