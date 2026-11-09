@@ -30,6 +30,7 @@
 #include <math.h>
 
 #include <retro_timers.h>
+#include <features/features_cpu.h>
 #include <compat/apple_compat.h>
 #include <string/stdstring.h>
 
@@ -51,11 +52,22 @@ typedef struct cocoa_vk_ctx_data
    int swap_interval;
    unsigned width;
    unsigned height;
-   /* Manic MP: a new view size waits one check before it becomes a resize,
-    * see cocoa_vk_gfx_ctx_check_window. */
+   /* Manic MP: a new view size waits until it has held for two checks and
+    * COCOA_VK_RESIZE_SETTLE_USEC before it becomes a resize, see
+    * cocoa_vk_gfx_ctx_check_window. */
    unsigned pending_width;
    unsigned pending_height;
+   retro_time_t pending_since;
 } cocoa_vk_ctx_data_t;
+
+/* Manic MP: how long a new view size has to hold before the swapchain is
+ * recreated for it. The 2026-11-08 AirPlay session logged, at the connect,
+ * 2185x1640 -> 3278x2460 -> 1920x1080 within 22 ms: the view had joined the
+ * AirPlay window (so its container's 1.5x transform applied) but had not been
+ * laid out at the core's size yet, and two consecutive checks both saw the
+ * transient. 50 ms spans a layout pass at 60 Hz with room to spare and costs
+ * nothing visible: the old swapchain keeps presenting meanwhile. */
+#define COCOA_VK_RESIZE_SETTLE_USEC 50000
 
 /* TODO/FIXME - static globals */
 static unsigned g_vk_minor          = 0;
@@ -183,6 +195,23 @@ static CGFloat cocoa_vk_view_scale(void)
     return scale;
 }
 
+/* Manic MP: the pixel size of the screen the view is on, for the sanity
+ * check in cocoa_vk_gfx_ctx_check_window; false on the device screen, whose
+ * bounds follow the orientation and are not a bound worth checking. */
+static bool cocoa_vk_external_screen_pixels(unsigned *width, unsigned *height)
+{
+    UIScreen *screen = cocoa_vk_view_screen();
+    CGFloat   scale;
+    if (!screen || screen == [UIScreen mainScreen])
+        return false;
+    scale = screen.nativeScale;
+    if (scale <= 0.0)
+        scale = 1.0;
+    *width  = (unsigned)round(CGRectGetWidth(screen.bounds)  * scale);
+    *height = (unsigned)round(CGRectGetHeight(screen.bounds) * scale);
+    return *width > 0 && *height > 0;
+}
+
 /* Same arithmetic as MoltenVK's surface extent (bounds x contentsScale,
  * truncated), so the size reported here is the size of the swapchain it
  * creates once the layer carries this scale. */
@@ -251,17 +280,35 @@ static void cocoa_vk_gfx_ctx_check_window(void *data, bool *quit,
    if (new_width != *width || new_height != *height)
    {
 #if !defined(OSX)
+      unsigned screen_width, screen_height;
+      retro_time_t now = cpu_features_get_time_usec();
+
+      /* Manic MP: on an external screen a swapchain larger than the screen
+       * is never right (the view is scaled to fit the window), so such a
+       * size is the mid-move transient and is not even queued. */
+      if (     cocoa_vk_external_screen_pixels(&screen_width, &screen_height)
+            && (new_width > screen_width || new_height > screen_height))
+      {
+         cocoa_ctx->pending_width  = 0;
+         cocoa_ctx->pending_height = 0;
+         return;
+      }
+
       /* Manic MP: when the app moves the view to another window the first
-       * check can land before the layout pass, with the old bounds under the
-       * new transform. A size has to be seen twice in a row before the
-       * swapchain is recreated for it. */
+       * checks can land before the layout pass, with the old bounds under
+       * the new transform. A size has to hold for two checks and for
+       * COCOA_VK_RESIZE_SETTLE_USEC before the swapchain is recreated for
+       * it; a size that changes again restarts the wait. */
       if (     new_width  != cocoa_ctx->pending_width
             || new_height != cocoa_ctx->pending_height)
       {
          cocoa_ctx->pending_width  = new_width;
          cocoa_ctx->pending_height = new_height;
+         cocoa_ctx->pending_since  = now;
          return;
       }
+      if (now - cocoa_ctx->pending_since < COCOA_VK_RESIZE_SETTLE_USEC)
+         return;
       cocoa_vk_sync_layer();
 #endif
       *width  = new_width;
